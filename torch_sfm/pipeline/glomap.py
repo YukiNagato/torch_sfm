@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field, asdict
 from torch_sfm.core import Frame
 from torch_sfm.utils import Timer
+from torch_sfm.cache import create_cache, copy_cache
 import numpy as np
 import torch
 from pathlib import Path
@@ -36,6 +37,8 @@ class GlomapConfig:
 
     cache_frame_images: bool = True
     use_cache: bool = True
+    cache_backend: str = 'filesystem'  # filesystem or colmap
+    database_path: Path | None = None  # default: workspace/database.db
     update_cache_for_retrieval: bool = False
     update_cache_for_keypoints: bool = False
     update_cache_for_correspondence: bool = False
@@ -46,6 +49,10 @@ class GlomapConfig:
     position: PositionConfig = field(default_factory=PositionConfig)
     bundle_adjustment: BundleAdjustmentConfig = field(default_factory=BundleAdjustmentConfig)
     export_colmap: bool = True
+
+    def __post_init__(self):
+        if self.cache_backend not in ('filesystem', 'colmap'):
+            raise ValueError('cache_backend must be filesystem or colmap')
 
 
 @dataclass
@@ -71,7 +78,8 @@ class GlomapPipeline:
         self.cfg = cfg
         self.workspace = workspace
         self.cache_root = self.workspace / 'cache'
-        self.cache_root.mkdir(parents=True, exist_ok=True)
+        self.cache = create_cache(cfg.cache_backend, self.workspace, cfg.correspondence_method, cfg.database_path)
+        self._cache_prepared = False
         self.image_txt_path = self.workspace / 'images.txt'
         self.intrinsic_path = self.workspace / 'intrinsics.txt'
         with open(self.image_txt_path) as f:
@@ -79,6 +87,34 @@ class GlomapPipeline:
         self.frames = []
         self.extractor = None
         self.matcher = None
+
+    def _prepare_cache(self, frames, intrinsic=None):
+        if self.cfg.use_cache and (intrinsic is not None or not self._cache_prepared):
+            if self.cfg.cache_backend == 'colmap':
+                self.cache.prepare(frames, self.get_intrinsics() if intrinsic is None else intrinsic)
+            self._cache_prepared = True
+
+    def close(self):
+        self.cache.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    @timer
+    def convert_cache(self, backend, database_path=None):
+        """Copy cached stages without extracting/matching or changing this pipeline's backend."""
+        frames = self.frames or [Frame(frame_idx=i, frame_path=path)
+                                 for i, path in enumerate(self.image_list)]
+        intrinsic = self.get_intrinsics()
+        with create_cache(backend, self.workspace, self.cfg.correspondence_method, database_path) as target:
+            if target.path.resolve() == self.cache.path.resolve():
+                raise ValueError('Source and target caches must be different')
+            self.cache.prepare(frames, intrinsic)
+            target.prepare(frames, intrinsic)
+            return copy_cache(self.cache, target, frames)
     
     @timer
     def get_intrinsics(self):
@@ -93,9 +129,10 @@ class GlomapPipeline:
     @timer
     @torch.inference_mode()
     def get_retrieval_pairs(self):
-        retrieval_cache_path = self.cache_root / 'retrieval.txt'
-        if retrieval_cache_path.exists() and self.cfg.use_cache and not self.cfg.update_cache_for_retrieval:
-            retrieval_pairs = np.loadtxt(retrieval_cache_path, dtype=np.int32).reshape(-1, 2)
+        cached = (self.cache.load('retrieval') if self.cfg.use_cache
+                  and not self.cfg.update_cache_for_retrieval else None)
+        if cached is not None:
+            retrieval_pairs = cached
         else:
             retrieval = get_retrieval(self.cfg.retrieval_method)
             # extract features
@@ -120,7 +157,7 @@ class GlomapPipeline:
             retrieval_pairs = list(retrieval_pairs)
             retrieval_pairs = np.array(retrieval_pairs, dtype=np.int32).reshape(-1, 2)
             if self.cfg.use_cache:
-                np.savetxt(retrieval_cache_path, retrieval_pairs, fmt='%d')
+                self.cache.save('retrieval', retrieval_pairs)
 
         return retrieval_pairs
     
@@ -128,17 +165,15 @@ class GlomapPipeline:
     @torch.inference_mode()
     def get_keypoints(self, frames: List[Frame]):
         """Fill each frame's keypoints_2d and features, and return the frames."""
-        keypoints_cache_root = self.cache_root / 'keypoints' / self.cfg.correspondence_method
-        if self.cfg.use_cache:
-            keypoints_cache_root.mkdir(parents=True, exist_ok=True)
+        self._prepare_cache(frames)
 
         for frame in tqdm(frames, desc='Extract keypoints'):
-            keypoints_cache_path = keypoints_cache_root / f'{frame.frame_idx}.pt'
-            if keypoints_cache_path.exists() and self.cfg.use_cache and not self.cfg.update_cache_for_keypoints:
+            data = (self.cache.load('keypoints', frame.frame_idx) if self.cfg.use_cache
+                    and not self.cfg.update_cache_for_keypoints else None)
+            if data is not None:
                 device = frame.image.device if frame.image is not None else 'cpu'
-                data = torch.load(keypoints_cache_path, map_location=device, weights_only=True)
-                frame.keypoints_2d = data['keypoints_2d']
-                frame.features = data['features']
+                frame.keypoints_2d = data['keypoints_2d'].to(device)
+                frame.features = data['features'].to(device)
             else:
                 if self.extractor is None:
                     self.extractor, self.matcher = get_extractor_and_matcher(self.cfg.correspondence_method)
@@ -148,10 +183,10 @@ class GlomapPipeline:
                 if not self.cfg.cache_frame_images:
                     frame.image = image
                 if self.cfg.use_cache:
-                    torch.save({
+                    self.cache.save('keypoints', {
                         'keypoints_2d': frame.keypoints_2d.cpu(),
                         'features': frame.features.cpu(),
-                    }, keypoints_cache_path)
+                    }, frame.frame_idx)
 
         return frames
 
@@ -159,19 +194,17 @@ class GlomapPipeline:
     @torch.inference_mode()
     def get_correspondences(self, frames: List[Frame], retrieval_pairs: np.ndarray):
         """Return {(i, j): Matches} on CPU; pairs index the supplied frames."""
-        correspondence_cache_root = self.cache_root / 'correspondences' / self.cfg.correspondence_method
-        if self.cfg.use_cache:
-            correspondence_cache_root.mkdir(parents=True, exist_ok=True)
+        self._prepare_cache(frames)
 
         correspondences = {}
         for i, j in tqdm(retrieval_pairs, desc='Match pairs'):
             i, j = int(i), int(j)
             frame0, frame1 = frames[i], frames[j]
-            correspondence_cache_path = correspondence_cache_root / f'{frame0.frame_idx}_{frame1.frame_idx}.pt'
-            if (correspondence_cache_path.exists() and self.cfg.use_cache
+            key = (frame0.frame_idx, frame1.frame_idx)
+            data = (self.cache.load('correspondences', key) if self.cfg.use_cache
                     and not self.cfg.update_cache_for_correspondence
-                    and not self.cfg.update_cache_for_keypoints):
-                data = torch.load(correspondence_cache_path, map_location='cpu', weights_only=True)
+                    and not self.cfg.update_cache_for_keypoints else None)
+            if data is not None:
                 matches = Matches(data['indices'], data['scores'])
             else:
                 if self.matcher is None:
@@ -184,10 +217,10 @@ class GlomapPipeline:
                 if not self.cfg.cache_frame_images:
                     frame0.image, frame1.image = image0, image1
                 if self.cfg.use_cache:
-                    torch.save({
+                    self.cache.save('correspondences', {
                         'indices': matches.indices,
                         'scores': matches.scores,
-                    }, correspondence_cache_path)
+                    }, key)
             correspondences[i, j] = matches
 
         return correspondences
@@ -200,9 +233,7 @@ class GlomapPipeline:
             matrices = matrices.expand(len(frames), 3, 3)
         if matrices.shape != (len(frames), 3, 3):
             raise ValueError('Provide shared pinhole intrinsics or one camera matrix per frame')
-        cache_root = self.cache_root / 'two_view' / self.cfg.correspondence_method
-        if self.cfg.use_cache:
-            cache_root.mkdir(parents=True, exist_ok=True)
+        self._prepare_cache(frames, intrinsic)
         sizes = []
         for frame in frames:
             if frame.image is not None:
@@ -217,7 +248,7 @@ class GlomapPipeline:
         options = asdict(self.cfg.two_view)
         for (i, j), matches in tqdm(correspondences.items(), desc='Verify pairs'):
             frame0, frame1 = frames[i], frames[j]
-            cache_path = cache_root / f'{frame0.frame_idx}_{frame1.frame_idx}.pt'
+            key = (frame0.frame_idx, frame1.frame_idx)
             # Geometry also depends on calibration, thresholds and matched pixels.
             inputs = {
                 'intrinsics': matrices[[i, j]].cpu(),
@@ -227,8 +258,8 @@ class GlomapPipeline:
                 'points1': frame1.keypoints_2d[matches.indices[:, 1].to(frame1.keypoints_2d.device)].cpu(),
             }
             data = None
-            if cache_path.exists() and self.cfg.use_cache and not refresh:
-                cached = torch.load(cache_path, map_location='cpu', weights_only=True)
+            cached = self.cache.load('two_view', key) if self.cfg.use_cache and not refresh else None
+            if cached is not None:
                 if (cached.get('version') == 2 and cached['options'] == options
                         and cached['sizes'] == (sizes[i], sizes[j])
                         and all(torch.equal(value, cached['inputs'][key]) for key, value in inputs.items())):
@@ -246,8 +277,8 @@ class GlomapPipeline:
                             for key, value in vars(geometry).items() if key != 'matches'}
                     data['indices'] = geometry.matches.indices.cpu()
                     data['scores'] = geometry.matches.scores.cpu()
-                    torch.save({'version': 2, 'options': options, 'sizes': (sizes[i], sizes[j]),
-                                'inputs': inputs, 'geometry': data}, cache_path)
+                    self.cache.save('two_view', {'version': 2, 'options': options,
+                                    'sizes': (sizes[i], sizes[j]), 'inputs': inputs, 'geometry': data}, key)
             geometries[i, j] = geometry
         return geometries
 
@@ -287,6 +318,7 @@ class GlomapPipeline:
     def run(self):
         intrinsic = self.get_intrinsics()
         self.load_frames()
+        self._prepare_cache(self.frames, intrinsic)
         retrieval_pairs = self.get_retrieval_pairs()
         self.get_keypoints(self.frames)
         correspondences = self.get_correspondences(self.frames, retrieval_pairs)

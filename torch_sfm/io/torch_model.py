@@ -11,6 +11,17 @@ from ..geometry.averaging import so3_log
 from ..geometry.two_view import camera_matrix
 
 
+def relative_image_name(image_path: Path, image_root: Path | None = None):
+    """Use identical portable image names in the database and sparse model."""
+    image_path = Path(image_path)
+    if image_root is not None:
+        try:
+            return image_path.resolve().relative_to(Path(image_root).resolve()).as_posix()
+        except ValueError:
+            pass
+    return image_path.name
+
+
 @torch.no_grad()
 def export_colmap(frames, result, path: Path, image_root: Path | None = None):
     rotations = result.rotations.detach().cpu().double()
@@ -53,13 +64,7 @@ def export_colmap(frames, result, path: Path, image_root: Path | None = None):
         else:
             recon.cameras[camera_id] = Camera(camera_id, CameraModel.PINHOLE, width, height, params.numpy())
         frame_path = Path(frame.frame_path) if frame.frame_path is not None else Path(f'{frame_index}.png')
-        if image_root is not None:
-            try:
-                name = frame_path.relative_to(image_root).as_posix()
-            except ValueError:
-                name = frame_path.name
-        else:
-            name = frame_path.name
+        name = relative_image_name(frame_path, image_root)
         if name in names:
             raise ValueError(f'Duplicate exported image name: {name}')
         names.add(name)
