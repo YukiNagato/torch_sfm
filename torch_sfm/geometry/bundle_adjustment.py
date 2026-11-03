@@ -8,16 +8,19 @@ import torch
 import torch.nn.functional as F
 import torchls as tls
 
-from .averaging import _huber, _check_solution, build_tracks, largest_component
+from .averaging import _check_solution, build_tracks, largest_component
 from .two_view import camera_matrix, homogeneous
+from .triangulation import TriangulationConfig
 
 
 @dataclass
 class BundleAdjustmentConfig:
+    strategy: str = 'glomap'
     enabled: bool = True
+    optimizer_backend: str = 'torchls'  # optional 'bae' LM/PCG adapter
     num_rounds: int = 3
-    fixed_rotation_iterations: int = 20
-    max_iterations: int = 50
+    fixed_rotation_iterations: int = 200
+    max_iterations: int = 200
     loss_scale: float = 1.0  # Huber, pixels
     max_reprojection_error: float = 4.0  # final pixel threshold
     initial_max_reprojection_error: float = 40.0
@@ -26,12 +29,49 @@ class BundleAdjustmentConfig:
     min_views_per_track: int = 2
     min_observations_per_image: int = 3
     refine_focal_length: bool = True
-    refine_principal_point: bool = True  # unlock only in the final joint BA
-    principal_point_prior_sigma: float | None = 0.02  # fraction of width/height; None disables prior
+    refine_principal_point: bool = False  # native GLOMAP keeps this fixed
+    principal_point_prior_sigma: float | None = None  # fraction of width/height; None disables prior
     retriangulate: bool = True
     linear_solver: str = 'auto'
+    normal_blocks_backend: str = 'auto'  # auto enables fused blocks with Warp PCG
+    pose_parameterization: str = 'joint'  # same updates in one 6D variable; 'split' for comparison
+    fixed_camera_handling: str = 'masked'  # 'grouped': pass fixed cameras as residual data
+    conjugate_gradient: tls.ConjugateGradientConfig = field(default_factory=lambda:
+        tls.ConjugateGradientConfig(rtol=1e-6, max_iterations=300,
+                                    preconditioner_groups=(("rotations", "centers"),)))
+    jacobian_batch_size: int | str | None = 'auto'  # None: one vmap; int: explicit chunks
+    jacobian_batch_memory_mb: float = 256.0  # estimated temporary AD working set
+    min_track_length: int = 3  # BA admission; filtering can still retain two observations
+    cost_tolerance: float = 1e-5
+    gradient_tolerance: float = 1e-4
+    parameter_tolerance: float = 0.0
+    lambda_initial: float = 1e-4
+    step_quality_min: float = 1e-3
+    max_normalized_reprojection_error: float = .01
+    filter_min_change: float = .001
+    normalize: bool = True
+    triangulation: TriangulationConfig = field(default_factory=TriangulationConfig)
+    retriangulation_max_refinements: int = 5
+    retriangulation_max_iterations: int = 50
+    retriangulation_min_change: float = .0005
+    refinement_max_reprojection_error: float = 4.0
+    refinement_min_tri_angle: float = 1.5
+
+    @classmethod
+    def legacy(cls, **overrides):
+        values = dict(strategy='legacy', fixed_rotation_iterations=20, max_iterations=50,
+                      refine_principal_point=True, principal_point_prior_sigma=.02,
+                      min_track_length=2, cost_tolerance=1e-7,
+                      gradient_tolerance=1e-7, parameter_tolerance=1e-10,
+                      lambda_initial=1e-3, step_quality_min=1e-4)
+        values.update(overrides)
+        return cls(**values)
 
     def __post_init__(self):
+        if self.optimizer_backend not in ('torchls', 'bae'):
+            raise ValueError('optimizer_backend must be torchls or bae')
+        if self.strategy not in ('glomap', 'legacy'):
+            raise ValueError('BA strategy must be glomap or legacy')
         if self.num_rounds < 1 or self.max_iterations < 1 or self.fixed_rotation_iterations < 0:
             raise ValueError('Invalid bundle adjustment iteration limits')
         if min(self.loss_scale, self.max_reprojection_error, self.initial_max_reprojection_error) <= 0:
@@ -42,6 +82,36 @@ class BundleAdjustmentConfig:
             raise ValueError('BA needs at least two views per track and three observations per image')
         if self.linear_solver not in ('auto', 'schur_dense', 'schur_cg', 'conjugate_gradient', 'dense_qr'):
             raise ValueError('Unknown BA linear solver')
+        if self.normal_blocks_backend not in ('auto', 'torch', 'warp'):
+            raise ValueError('normal_blocks_backend must be auto, torch or warp')
+        if self.pose_parameterization not in ('split', 'joint'):
+            raise ValueError('pose_parameterization must be split or joint')
+        if self.fixed_camera_handling not in ('masked', 'grouped'):
+            raise ValueError('fixed_camera_handling must be masked or grouped')
+        if self.fixed_camera_handling == 'grouped' and self.pose_parameterization != 'joint':
+            raise ValueError('Grouped fixed cameras currently require joint pose_parameterization')
+        if not isinstance(self.conjugate_gradient, tls.ConjugateGradientConfig):
+            raise TypeError('conjugate_gradient must be a ConjugateGradientConfig')
+        if self.jacobian_batch_size is not None and self.jacobian_batch_size != 'auto':
+            if (isinstance(self.jacobian_batch_size, bool)
+                    or not isinstance(self.jacobian_batch_size, int) or self.jacobian_batch_size < 1):
+                raise ValueError('jacobian_batch_size must be auto, a positive integer, or None')
+        if not math.isfinite(self.jacobian_batch_memory_mb) or self.jacobian_batch_memory_mb < 1 / 1024**2:
+            raise ValueError('jacobian_batch_memory_mb must be finite and at least one byte')
+        if self.min_track_length < 2 or self.retriangulation_max_refinements < 0 or self.retriangulation_max_iterations < 1:
+            raise ValueError('Invalid BA track length or refinement budgets')
+        if not isinstance(self.triangulation, TriangulationConfig):
+            raise TypeError('triangulation must be a TriangulationConfig')
+        if not all(math.isfinite(v) and v >= 0 for v in (
+                self.cost_tolerance, self.gradient_tolerance, self.parameter_tolerance,
+                self.filter_min_change, self.retriangulation_min_change)):
+            raise ValueError('BA tolerances must be finite and nonnegative')
+        if not all(math.isfinite(v) and v > 0 for v in (
+                self.max_normalized_reprojection_error, self.refinement_max_reprojection_error,
+                self.lambda_initial)) or not 0 <= self.step_quality_min < 1:
+            raise ValueError('Invalid BA thresholds or damping')
+        if not 0 <= self.refinement_min_tri_angle < 90:
+            raise ValueError('Invalid refinement triangulation angle')
         if self.principal_point_prior_sigma is not None and (
                 not math.isfinite(self.principal_point_prior_sigma) or self.principal_point_prior_sigma <= 0):
             raise ValueError('Principal point prior sigma must be positive and finite, or None')
@@ -77,8 +147,51 @@ class _IntrinsicsVar(tls.Var, default_factory=lambda: torch.stack((torch.zeros(4
 class _RotationVar(tls.Var, default_factory=lambda: torch.cat((torch.eye(3), torch.ones(1, 3))),
                    tangent_dim=3,
                    retract_fn=lambda value, delta: torch.cat((
-                       value[:3] @ tls.so3_exp(value[3] * delta), value[3:]))):
+                       value[:3] @ tls.so3_exp(value[3] * delta), value[3:])),
+                   retract_jvp_fn=lambda value, direction: torch.cat((
+                       tls.so3_retract_jvp(value[:3], value[3] * direction),
+                       torch.zeros_like(value[3:])))):
     pass
+
+
+def _pose_retract(value, delta):
+    # Rows: R(3), world camera center(1), rotation mask(1), center mask(1).
+    # Product retraction, exactly matching _RotationVar and _CenterVar.
+    return torch.cat((value[:3] @ tls.so3_exp(value[4] * delta[:3]),
+                      (value[3] + value[5] * delta[3:])[None], value[4:]))
+
+
+def _pose_retract_jvp(value, direction):
+    # Exact derivative of the existing rotation + world-center product update.
+    # Keep its masks and convention; this is not an SE(3) change of coordinates.
+    return torch.cat((
+        tls.so3_retract_jvp(value[:3], value[4] * direction[:3]),
+        (value[5] * direction[3:])[None], torch.zeros_like(value[4:]),
+    ))
+
+
+class _PoseVar(tls.Var,
+               default_factory=lambda: torch.cat((torch.eye(3), torch.zeros(1, 3), torch.ones(2, 3))),
+               tangent_dim=6, retract_fn=_pose_retract, retract_jvp_fn=_pose_retract_jvp):
+    pass
+
+
+def _ba_cg_config(cfg, solver):
+    cg = cfg.conjugate_gradient
+    if solver not in ('conjugate_gradient', 'schur_cg'):
+        return replace(cg, preconditioner_groups=())
+    if cfg.pose_parameterization == 'split':
+        return cg
+    groups = []
+    for group in cg.preconditioner_groups:
+        members = set(group) & {'rotations', 'centers'}
+        if members and members != {'rotations', 'centers'}:
+            raise ValueError('Joint poses require rotations and centers in the same '
+                             'preconditioner group; use poses to name the combined variable')
+        mapped = tuple(dict.fromkeys('poses' if key in members else key for key in group))
+        if len(mapped) > 1:
+            groups.append(mapped)
+    return replace(cg, preconditioner_groups=tuple(groups))
 
 
 def _pinhole_parameters(intrinsics):
@@ -202,10 +315,65 @@ def filter_tracks(frames, rotations, centers, points3d, observations, intrinsics
     return _active_component(points3d, observations, len(frames), cfg)
 
 
-def _reprojection_residual(rotation, center, point, intrinsics, observed, loss_scale):
+def _reprojection_residual(rotation, center, point, intrinsics, observed):
     local = rotation[:3] @ (point - center[0])
-    predicted = intrinsics[0, :2].exp() * local[:2] / local[2].clamp_min(1e-8) + intrinsics[0, 2:]
-    return _huber(predicted - observed, loss_scale)
+    return _project_residual(local, intrinsics, observed)
+
+
+def _pose_reprojection_residual(pose, point, intrinsics, observed):
+    return _project_residual(pose[:3] @ (point - pose[3]), intrinsics, observed)
+
+
+def _project_residual(local, intrinsics, observed):
+    # Match COLMAP PINHOLE's HasProjectableDepth + ReprojErrorCostFunctor:
+    # a failed projection contributes zero residual and zero Jacobian.
+    projectable = local[2] >= torch.finfo(local.dtype).eps
+    # torch.where evaluates both branches; do not divide by an invalid depth
+    # even though its residual will be masked out below.
+    depth = torch.where(projectable, local[2], torch.ones_like(local[2]))
+    predicted = intrinsics[0, :2].exp() * local[:2] / depth + intrinsics[0, 2:]
+    return torch.where(projectable, predicted - observed, torch.zeros_like(observed))
+
+
+def _grouped_camera_problem(rotations, centers, rotation_mask, center_mask, points,
+                            intrinsic_values, camera_ids, point_ids, intrinsic_ids,
+                            pixels, cfg, batch_size, fixed_rotations):
+    """Keep every observation; fixed arguments are ordinary batched data."""
+    active = center_mask.bool().any(-1) | rotation_mask.bool().any(dim=(-2, -1))
+    active_ids = torch.where(active)[0]
+    remap = torch.full_like(active, -1, dtype=torch.long)
+    remap[active_ids] = torch.arange(len(active_ids), device=active.device)
+    pose_values = torch.cat((rotations, centers[:, None], rotation_mask, center_mask[:, None]), 1)
+    camera_key = 'centers' if fixed_rotations else 'poses'
+    camera_values = (torch.stack((centers, center_mask), 1) if fixed_rotations else pose_values)
+    parameters, manifolds = {}, {}
+    if len(active_ids):
+        parameters[camera_key] = camera_values[active_ids]
+        manifolds[camera_key] = _CenterVar if fixed_rotations else _PoseVar
+    parameters['points'] = points.clone()
+    active_intrinsics = bool(intrinsic_values[:, 1].bool().any())
+    if active_intrinsics:
+        parameters['intrinsics'] = intrinsic_values
+        manifolds['intrinsics'] = _IntrinsicsVar
+    problem = tls.Problem(parameters, manifolds=manifolds)
+    moving = active[camera_ids]
+    for is_moving in (True, False):
+        rows = torch.where(moving == is_moving)[0]
+        if not len(rows):
+            continue
+        ci, ii = camera_ids[rows], intrinsic_ids[rows]
+        intrinsic_arg = ('intrinsics', ii) if active_intrinsics else intrinsic_values[ii]
+        if is_moving and fixed_rotations:
+            # No rotation parameter/Jacobian columns in the fixed-rotation stage.
+            residual = _reprojection_residual
+            args = (rotations[ci], ('centers', remap[ci]))
+        else:
+            residual = _pose_reprojection_residual
+            args = ((('poses', remap[ci]) if is_moving else pose_values[ci]),)
+        problem.add_residual(residual, *args, ('points', point_ids[rows]), intrinsic_arg,
+                             pixels[rows], loss=tls.HuberLoss(delta=cfg.loss_scale),
+                             batch_size=batch_size)
+    return problem, camera_key, active_ids
 
 
 def _principal_point_prior(intrinsics, reference, sigma):
@@ -234,6 +402,15 @@ def _principal_point_sigma(frames, nodes, intrinsics, relative_sigma):
 @torch.inference_mode(False)
 def _solve_ba(frames, rotations, centers, points, observations, intrinsics, cfg,
               fixed_rotations, max_iterations, principal_point_reference=None):
+    original_points = points
+    counts = torch.bincount(observations[:, 0], minlength=len(points))
+    eligible = counts >= cfg.min_track_length
+    keep = eligible[observations[:, 0]]
+    if not bool(keep.any()):
+        summary = tls.SolveSummary(0., 0., termination_reason='no_eligible_tracks')
+        return rotations.clone(), centers.clone(), points.clone(), intrinsics.clone(), summary
+    points, observations = _compact(points, observations, keep, cfg.min_track_length)
+    optimized_point_ids = torch.where(eligible)[0]
     nodes = torch.unique(observations[:, 1], sorted=True)
     mapping = torch.full((len(frames),), -1, dtype=torch.long, device=points.device)
     mapping[nodes] = torch.arange(len(nodes), device=points.device)
@@ -258,18 +435,57 @@ def _solve_ba(frames, rotations, centers, points, observations, intrinsics, cfg,
     intrinsic_mask = torch.zeros_like(current_intrinsics)
     intrinsic_mask[:, :2] = float(cfg.refine_focal_length)
     intrinsic_mask[:, 2:] = float(cfg.refine_principal_point)
-    parameters = {
-        'rotations': torch.cat((rotations[nodes], rotation_mask), 1),
-        'centers': torch.stack((current_centers, center_mask), 1),
-        'points': points.clone(),
-        'intrinsics': torch.stack((current_intrinsics, intrinsic_mask), 1),
-    }
-    problem = tls.Problem(parameters, manifolds={
-        'rotations': _RotationVar, 'centers': _CenterVar, 'intrinsics': _IntrinsicsVar})
+    intrinsic_values = torch.stack((current_intrinsics, intrinsic_mask), 1)
     intrinsic_ids = torch.zeros_like(camera_ids) if shared else camera_ids
-    problem.add_residual(_reprojection_residual, ('rotations', camera_ids), ('centers', camera_ids),
-        ('points', observations[:, 0]), ('intrinsics', intrinsic_ids),
-        _measurements(frames, observations, points), cfg.loss_scale, batch_size=4096)
+    batch_size = (tls.AutoBatchSize(memory_budget_bytes=int(cfg.jacobian_batch_memory_mb * 1024**2))
+                  if cfg.jacobian_batch_size == 'auto' else cfg.jacobian_batch_size)
+    pixels = _measurements(frames, observations, points)
+    if cfg.optimizer_backend == 'bae':
+        # Import only when selected: BAE registers process-wide sparse operators.
+        from .bae_bundle_adjustment import solve_bae
+        solved_r, solved_c, solved_p, solved_k, summary = solve_bae(
+            rotations[nodes], current_centers, rotation_mask, center_mask, points,
+            intrinsic_values, camera_ids, observations[:, 0], intrinsic_ids, pixels,
+            cfg, max_iterations,
+        )
+        updated_r, updated_c = rotations.clone(), centers.clone()
+        updated_r[nodes], updated_c[nodes] = solved_r, solved_c
+        updated_p = original_points.clone()
+        updated_p[optimized_point_ids] = solved_p
+        solved_k = solved_k.clone()
+        solved_k[:, :2] = solved_k[:, :2].exp()
+        if shared:
+            updated_k = solved_k[0]
+        else:
+            updated_k = params.clone()
+            updated_k[nodes] = solved_k
+        _check_solution(summary, 'BAE bundle adjustment')
+        return updated_r, updated_c, updated_p, _restore_intrinsics(updated_k, intrinsics), summary
+    grouped = cfg.fixed_camera_handling == 'grouped'
+    if grouped:
+        problem, _, active_camera_ids = _grouped_camera_problem(
+            rotations[nodes], current_centers, rotation_mask, center_mask, points,
+            intrinsic_values, camera_ids, observations[:, 0], intrinsic_ids, pixels,
+            cfg, batch_size, fixed_rotations)
+    else:
+        if cfg.pose_parameterization == 'joint':
+            parameters = {'poses': torch.cat((rotations[nodes], current_centers[:, None],
+                                             rotation_mask, center_mask[:, None]), 1)}
+            manifolds = {'poses': _PoseVar}
+            residual_fn = _pose_reprojection_residual
+            pose_args = (('poses', camera_ids),)
+        else:
+            parameters = {'rotations': torch.cat((rotations[nodes], rotation_mask), 1),
+                          'centers': torch.stack((current_centers, center_mask), 1)}
+            manifolds = {'rotations': _RotationVar, 'centers': _CenterVar}
+            residual_fn = _reprojection_residual
+            pose_args = (('rotations', camera_ids), ('centers', camera_ids))
+        parameters.update(points=points.clone(), intrinsics=intrinsic_values)
+        manifolds['intrinsics'] = _IntrinsicsVar
+        problem = tls.Problem(parameters, manifolds=manifolds)
+        problem.add_residual(residual_fn, *pose_args,
+            ('points', observations[:, 0]), ('intrinsics', intrinsic_ids), pixels,
+            loss=tls.HuberLoss(delta=cfg.loss_scale), batch_size=batch_size)
     if cfg.refine_principal_point and cfg.principal_point_prior_sigma is not None:
         reference = intrinsics if principal_point_reference is None else principal_point_reference.to(intrinsics)
         reference = _pinhole_parameters(reference)
@@ -278,25 +494,46 @@ def _solve_ba(frames, rotations, centers, points, observations, intrinsics, cfg,
         # One Gaussian prior per intrinsic block, independent of observation count.
         problem.add_residual(_principal_point_prior,
             ('intrinsics', torch.arange(len(current_intrinsics), device=points.device)), reference, sigma)
-    retained_dim = len(nodes) * 6 + len(current_intrinsics) * 4
+    retained_dim = problem.tangent_dim - points.numel()
     solver = cfg.linear_solver
     if solver == 'auto':
         solver = 'schur_dense' if retained_dim <= 1024 else 'schur_cg'
+    cg = _ba_cg_config(cfg, solver)
+    if grouped and fixed_rotations:
+        cg = replace(cg, preconditioner_groups=tuple(
+            tuple('centers' if key == 'poses' else key for key in group)
+            for group in cg.preconditioner_groups))
     options = dict(
         linear_solver=solver, jacobi_scaling=True, return_summary=True,
-        termination=tls.TerminationConfig(max_iterations=max_iterations, cost_tolerance=1e-7,
-                                         gradient_tolerance=1e-7),
-        conjugate_gradient=tls.ConjugateGradientConfig(rtol=1e-6, max_iterations=300),
-        trust_region=tls.TrustRegionConfig(lambda_initial=1e-3, strategy='adaptive', damping_mode='diagonal'),
+        normal_blocks_backend=cfg.normal_blocks_backend,
+        termination=tls.TerminationConfig(max_iterations=max_iterations, cost_tolerance=cfg.cost_tolerance,
+                                         gradient_tolerance=cfg.gradient_tolerance,
+                                         parameter_tolerance=cfg.parameter_tolerance),
+        conjugate_gradient=cg,
+        trust_region=tls.TrustRegionConfig(lambda_initial=cfg.lambda_initial, strategy='adaptive',
+                                          damping_mode='diagonal', step_quality_min=cfg.step_quality_min),
     )
     if solver.startswith('schur_'):
         options['eliminate'] = 'points'
     solved, summary = problem.solve(**options)
     _check_solution(summary, 'Bundle adjustment')
     updated_rotations, updated_centers = rotations.clone(), centers.clone()
-    updated_rotations[nodes] = solved['rotations'][:, :3]
-    updated_centers[nodes] = solved['centers'][:, 0]
-    updated_parameters = solved['intrinsics'][:, 0].clone()
+    if grouped:
+        active_nodes = nodes[active_camera_ids]
+        if fixed_rotations:
+            updated_centers[active_nodes] = solved['centers'][:, 0]
+        else:
+            updated_rotations[active_nodes] = solved['poses'][:, :3]
+            updated_centers[active_nodes] = solved['poses'][:, 3]
+    elif cfg.pose_parameterization == 'joint':
+        updated_rotations[nodes] = solved['poses'][:, :3]
+        updated_centers[nodes] = solved['poses'][:, 3]
+    else:
+        updated_rotations[nodes] = solved['rotations'][:, :3]
+        updated_centers[nodes] = solved['centers'][:, 0]
+    updated_parameters = (solved['intrinsics'][:, 0].clone()
+                          if bool(intrinsic_mask.bool().any()) or not grouped
+                          else current_intrinsics.clone())
     updated_parameters[:, :2] = updated_parameters[:, :2].exp()
     if shared:
         output_parameters = updated_parameters[0]
@@ -304,7 +541,9 @@ def _solve_ba(frames, rotations, centers, points, observations, intrinsics, cfg,
         output_parameters = params.clone()
         output_parameters[nodes] = updated_parameters
     output_intrinsics = _restore_intrinsics(output_parameters, intrinsics)
-    return updated_rotations, updated_centers, solved['points'], output_intrinsics, summary
+    updated_points = original_points.clone()
+    updated_points[optimized_point_ids] = solved['points']
+    return updated_rotations, updated_centers, updated_points, output_intrinsics, summary
 
 
 @torch.no_grad()
@@ -394,9 +633,9 @@ def retriangulate_tracks(frames, rotations, centers, points, observations, intri
 
 
 @torch.inference_mode(False)
-def bundle_adjustment(frames, rotations, centers, points3d, observations, intrinsics,
+def legacy_bundle_adjustment(frames, rotations, centers, points3d, observations, intrinsics,
                       registered, cfg=None, geometries=None):
-    cfg = BundleAdjustmentConfig() if cfg is None else cfg
+    cfg = BundleAdjustmentConfig.legacy() if cfg is None else cfg
     rotations = rotations.detach().clone()
     centers = centers.detach().to(rotations).clone()
     points = points3d.detach().to(rotations).clone()
@@ -484,3 +723,15 @@ def bundle_adjustment(frames, rotations, centers, points3d, observations, intrin
     stats['positive_depth'] = int(positive.sum())
     return BundleAdjustmentResult(rotations, centers, points, observations, registered,
                                   intrinsics, errors, summaries, stats)
+
+
+@torch.inference_mode(False)
+def bundle_adjustment(frames, rotations, centers, points3d, observations, intrinsics,
+                      registered, cfg=None, geometries=None):
+    cfg = BundleAdjustmentConfig() if cfg is None else cfg
+    if cfg.strategy == 'legacy':
+        return legacy_bundle_adjustment(frames, rotations, centers, points3d, observations,
+                                        intrinsics, registered, cfg, geometries)
+    from .global_bundle_adjustment import global_bundle_adjustment
+    return global_bundle_adjustment(frames, rotations, centers, points3d, observations,
+                                     intrinsics, registered, cfg, geometries)

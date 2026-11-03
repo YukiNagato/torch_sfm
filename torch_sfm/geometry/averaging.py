@@ -4,7 +4,7 @@ All numerical work uses PyTorch and torchls. Python dictionaries and union-find
 only handle view-graph and feature-track connectivity.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 
 import torch
@@ -15,7 +15,8 @@ from .two_view import camera_matrix, homogeneous
 
 
 class SO3Var(tls.Var, default_factory=lambda: torch.eye(3), tangent_dim=3,
-             retract_fn=lambda rotation, delta: rotation @ tls.so3_exp(delta)):
+             retract_fn=lambda rotation, delta: rotation @ tls.so3_exp(delta),
+             retract_jvp_fn=tls.so3_retract_jvp):
     pass
 
 
@@ -50,10 +51,32 @@ class PositionConfig:
     max_iterations: int = 100
     loss_scale: float = 0.1  # Huber threshold for unit-bearing residuals
     min_views_per_track: int = 3
+    scale_parameterization: str = 'bounded'  # Euclidean scales with solver-side lower bounds
+    scale_initialization: str = 'unit'  # 'geometry' retains the previous initialization
+    pairwise_linear_solver: str = 'auto'  # dense Schur for small camera systems
+    pcg_rtol: float = 1e-3
+    pairwise_max_iterations: int = 20  # warm start when tracks permit joint refinement
+    track_strategy: str = 'conflict_aware'  # or 'colmap': union first, reject inconsistent tracks
+    track_intra_image_consistency_threshold: float = 10.0  # pixels, used by 'colmap'
 
     def __post_init__(self):
         if self.max_iterations < 1 or self.loss_scale <= 0 or self.min_views_per_track < 2:
             raise ValueError('Invalid global positioning options')
+        if self.scale_parameterization not in ('bounded', 'log'):
+            raise ValueError('Position scales must use bounded or log parameterization')
+        if self.scale_initialization not in ('unit', 'geometry'):
+            raise ValueError('Position scale initialization must be unit or geometry')
+        if self.pairwise_linear_solver not in ('auto', 'schur_dense', 'schur_cg'):
+            raise ValueError('Unknown pairwise positioning solver')
+        if not math.isfinite(self.pcg_rtol) or not 0 < self.pcg_rtol < 1:
+            raise ValueError('Position PCG tolerance must lie between zero and one')
+        if self.pairwise_max_iterations < 1:
+            raise ValueError('Pairwise initialization budget must be positive')
+        if self.track_strategy not in ('conflict_aware', 'colmap'):
+            raise ValueError('Unknown positioning track strategy')
+        if (not math.isfinite(self.track_intra_image_consistency_threshold)
+                or self.track_intra_image_consistency_threshold < 0):
+            raise ValueError('Track consistency threshold must be finite and nonnegative')
 
 
 @dataclass
@@ -166,6 +189,19 @@ def _solve_options(max_iterations):
     )
 
 
+def _position_options(cfg, num_cameras, *, pairwise=False, initializer=False):
+    iterations = min(cfg.max_iterations, cfg.pairwise_max_iterations) if initializer else cfg.max_iterations
+    options = _solve_options(iterations)
+    options['conjugate_gradient'] = replace(options['conjugate_gradient'], rtol=cfg.pcg_rtol)
+    solver = cfg.pairwise_linear_solver if pairwise else 'schur_cg'
+    if solver == 'auto':
+        solver = 'schur_dense' if 3*num_cameras <= 512 else 'schur_cg'
+    options.update(linear_solver=solver, eliminate='scales')
+    if cfg.scale_parameterization == 'bounded':
+        options['bounds'] = {'scales': (1e-5, None)}
+    return options
+
+
 def _check_solution(summary, stage):
     if not math.isfinite(summary.final_cost) or summary.termination_reason == 'nonfinite_linearization':
         raise RuntimeError(f'{stage} failed: {summary.termination_reason}')
@@ -237,8 +273,21 @@ def rotation_averaging(num_frames, geometries, cfg=None):
     return RotationResult(rotations, registered, edges, summaries)
 
 
-def build_tracks(geometries, active_frames, min_views=3):
-    """Merge verified matches, refusing unions with two features in one frame."""
+def build_tracks(geometries, active_frames, min_views=3, *, strategy='conflict_aware',
+                 frames=None, intra_image_threshold=10.0):
+    """Build positioning tracks from the caller's rotation-filtered image pairs.
+
+    conflict_aware rejects unions with multiple features from the same image.
+    colmap unions all matches first, rejects a whole component if any two of its
+    features in one image are farther apart than intra_image_threshold pixels,
+    and requires min_views distinct images. Nearby same-image features remain.
+    The colmap strategy requires frames for the keypoint coordinates.
+    """
+    if strategy == 'colmap':
+        return _build_colmap_tracks(geometries, active_frames, frames, min_views,
+                                    intra_image_threshold)
+    if strategy != 'conflict_aware':
+        raise ValueError('Unknown positioning track strategy')
     active = set(active_frames)
     parent, observations, visible, lookup = [], [], [], {}
 
@@ -282,15 +331,72 @@ def build_tracks(geometries, active_frames, min_views=3):
     return torch.tensor(rows, dtype=torch.long).reshape(-1, 3)
 
 
-def _huber(error, delta):
-    squared = error.square().sum()
-    length = squared.clamp_min(1e-24).sqrt()
-    rho = torch.where(length <= delta, squared, 2 * delta * length - delta ** 2)
-    return error * (rho.clamp_min(1e-24) / squared.clamp_min(1e-24)).sqrt()
+def _build_colmap_tracks(geometries, active_frames, frames, min_views, threshold):
+    """GlobalMapper::EstablishTracks with the default unlimited track budget.
+
+    Track IDs/order are canonical here, rather than C++ hash-table order. The
+    observation partitions and consistency rule match the native implementation.
+    """
+    if frames is None:
+        raise ValueError('colmap track strategy requires frames with keypoints')
+    if min_views < 2 or not math.isfinite(threshold) or threshold < 0:
+        raise ValueError('Invalid track view count or consistency threshold')
+    active = set(active_frames)
+    parent, sizes, observations, lookup = [], [], [], {}
+
+    def node(frame, keypoint):
+        key = frame, keypoint
+        if key not in lookup:
+            lookup[key] = len(parent)
+            parent.append(len(parent))
+            sizes.append(1)
+            observations.append(key)
+        return lookup[key]
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for (i, j), geometry in geometries.items():
+        if i not in active or j not in active:
+            continue
+        for kp0, kp1 in geometry.matches.indices.detach().cpu().tolist():
+            a, b = find(node(i, kp0)), find(node(j, kp1))
+            if a == b:
+                continue
+            if sizes[a] < sizes[b]:
+                a, b = b, a
+            parent[b] = a
+            sizes[a] += sizes[b]
+    tracks = {}
+    for index, observation in enumerate(observations):
+        tracks.setdefault(find(index), []).append(observation)
+    xy = {i: frames[i].keypoints_2d.detach().cpu().tolist() for i in active}
+    retained = []
+    squared_threshold = threshold * threshold
+    for track in tracks.values():
+        by_image = {}
+        consistent = True
+        for image, keypoint in track:
+            point = xy[image][keypoint]
+            previous = by_image.setdefault(image, [])
+            if any((point[0] - other[0]) ** 2 + (point[1] - other[1]) ** 2
+                   > squared_threshold for other in previous):
+                consistent = False
+                break
+            previous.append(point)
+        if consistent and len(by_image) >= min_views:
+            retained.append(sorted(track))
+    retained.sort(key=lambda track: (-len(track), track))
+    rows = [(pid, frame, keypoint) for pid, track in enumerate(retained)
+            for frame, keypoint in track]
+    return torch.tensor(rows, dtype=torch.long).reshape(-1, 3)
 
 
-def _direction_residual(center0, center1, scale, direction, delta):
-    return _huber(direction - scale[0] * (center1 - center0), delta)
+def _direction_residual(center0, center1, scale, direction):
+    return direction - scale[0] * (center1 - center0)
 
 
 def _center_prior(center):
@@ -359,23 +465,30 @@ def translation_averaging(frames, geometries, rotations, intrinsics, cfg=None):
         return empty
     node_set = set(nodes)
     usable = {pair: g for pair, g in usable.items() if pair[0] in node_set and pair[1] in node_set}
+    # Track connectivity is independent of the current camera centers. Build it
+    # once so pairwise-only outputs retain the full optimization budget.
+    observations = build_tracks(
+        geometries, nodes, cfg.min_views_per_track, strategy=cfg.track_strategy,
+        frames=frames,
+        intra_image_threshold=cfg.track_intra_image_consistency_threshold).to(device)
     centers, pairs, directions = _initial_centers(nodes, usable, rotations)
     supports = [len(geometry.matches.indices) for geometry in usable.values()]
     strongest = max(range(len(supports)), key=supports.__getitem__)
     anchor = pairs[strongest].tolist()
     centers, _ = _normalize_gauge(centers, centers[:0], anchor)
     baseline = (centers[pairs[:, 1]] - centers[pairs[:, 0]]).norm(dim=-1).clamp_min(1e-3)
-    problem = tls.Problem({'centers': centers, 'scales': baseline.reciprocal()[:, None]},
-                          manifolds={'scales': PositiveScaleVar})
+    scales = torch.ones_like(baseline) if cfg.scale_initialization == 'unit' else baseline.reciprocal()
+    manifolds = {'scales': PositiveScaleVar} if cfg.scale_parameterization == 'log' else {}
+    problem = tls.Problem({'centers': centers, 'scales': scales[:, None]}, manifolds=manifolds)
     problem.add_residual(_direction_residual, ('centers', pairs[:, 0]), ('centers', pairs[:, 1]),
-                         ('scales', torch.arange(len(pairs), device=device)), directions, cfg.loss_scale)
+                         ('scales', torch.arange(len(pairs), device=device)), directions,
+                         loss=tls.HuberLoss(delta=cfg.loss_scale))
     _add_gauge(problem, anchor)
-    solution, summary = problem.solve(linear_solver='schur_cg', eliminate='scales',
-                                      **_solve_options(cfg.max_iterations))
+    solution, summary = problem.solve(**_position_options(
+        cfg, len(nodes), pairwise=True, initializer=len(observations) > 0))
     _check_solution(summary, 'Pairwise positioning')
     summaries = [summary]
     centers, _ = _normalize_gauge(solution['centers'], centers[:0], anchor)
-    observations = build_tracks(geometries, nodes, cfg.min_views_per_track).to(device)
     if len(observations) == 0:
         centers_all[nodes] = centers
         registered[nodes] = True
@@ -419,16 +532,16 @@ def translation_averaging(frames, geometries, rotations, intrinsics, cfg=None):
         raise ValueError('Global positioning has no nonzero baseline')
     centers, points = _normalize_gauge(centers, points, anchor)
     offsets = points[point_ids] - centers[camera_ids]
-    # Initialize inverse depth by projecting the measured unit bearing.
-    scales = ((rays * offsets).sum(-1) / offsets.square().sum(-1).clamp_min(1e-12)).clamp_min(1e-5)
+    # Unit scales keep initially reversed/poorly triangulated bearings active.
+    scales = (torch.ones(len(rays), device=device, dtype=dtype) if cfg.scale_initialization == 'unit'
+              else ((rays * offsets).sum(-1) / offsets.square().sum(-1).clamp_min(1e-12)).clamp_min(1e-5))
     problem = tls.Problem({'centers': centers, 'points': points, 'scales': scales[:, None]},
-                          manifolds={'scales': PositiveScaleVar})
+                          manifolds=manifolds)
     problem.add_residual(_direction_residual, ('centers', camera_ids), ('points', point_ids),
-                         ('scales', torch.arange(len(rays), device=device)), rays, cfg.loss_scale,
-                         batch_size=4096)
+                         ('scales', torch.arange(len(rays), device=device)), rays,
+                         loss=tls.HuberLoss(delta=cfg.loss_scale), batch_size=4096)
     _add_gauge(problem, anchor)
-    solution, summary = problem.solve(linear_solver='schur_cg', eliminate='scales',
-                                      **_solve_options(cfg.max_iterations))
+    solution, summary = problem.solve(**_position_options(cfg, len(nodes)))
     _check_solution(summary, 'Track positioning')
     summaries.append(summary)
     centers, points = _normalize_gauge(solution['centers'], solution['points'], anchor)

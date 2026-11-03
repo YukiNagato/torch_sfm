@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, asdict
-from torch_sfm.core import Frame
+from torch_sfm.core import Frame, SFMStorage
 from torch_sfm.utils import Timer
 from torch_sfm.cache import create_cache, copy_cache
 import numpy as np
@@ -9,7 +9,7 @@ from torch_sfm.retrieval import get_retrieval, RetrievalResult
 from torch_sfm.correspondence import get_extractor_and_matcher, Matches
 from torch_sfm.geometry import (
     TwoViewConfig, TwoViewGeometry, RotationConfig, PositionConfig,
-    camera_matrix, verify_two_view, rotation_averaging, translation_averaging,
+    camera_matrix, verify_two_view_batch, rotation_averaging, translation_averaging,
     BundleAdjustmentConfig, bundle_adjustment,
 )
 from PIL import Image
@@ -87,6 +87,19 @@ class GlomapPipeline:
         self.frames = []
         self.extractor = None
         self.matcher = None
+        self.storage = None
+
+    @timer
+    def prepare_verification(self):
+        """Retain packed keypoint views and metadata, release pixels/features/models."""
+        device = self.cfg.geometry_device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.storage = SFMStorage.from_frames(self.frames, device=device, dtype=torch.float64)
+        for index, frame in enumerate(self.frames):
+            view = Frame.from_storage(self.storage, index)
+            frame.keypoints_2d, frame.image_size = view.keypoints_2d, view.image_size
+            frame.image, frame.features = None, None
+        self.extractor = self.matcher = None
+        return self.storage
 
     def _prepare_cache(self, frames, intrinsic=None):
         if self.cfg.use_cache and (intrinsic is not None or not self._cache_prepared):
@@ -238,11 +251,13 @@ class GlomapPipeline:
         for frame in frames:
             if frame.image is not None:
                 sizes.append(tuple(frame.image.shape[-2:]))
+            elif frame.image_size is not None:
+                sizes.append(frame.image_size)
             else:
                 with Image.open(frame.frame_path) as image:
                     sizes.append((image.height, image.width))
 
-        geometries = {}
+        geometries, pending = {}, {}
         refresh = (self.cfg.update_cache_for_two_view or self.cfg.update_cache_for_keypoints
                    or self.cfg.update_cache_for_correspondence)
         options = asdict(self.cfg.two_view)
@@ -260,7 +275,7 @@ class GlomapPipeline:
             data = None
             cached = self.cache.load('two_view', key) if self.cfg.use_cache and not refresh else None
             if cached is not None:
-                if (cached.get('version') == 2 and cached['options'] == options
+                if (cached.get('version') == 3 and cached['options'] == options
                         and cached['sizes'] == (sizes[i], sizes[j])
                         and all(torch.equal(value, cached['inputs'][key]) for key, value in inputs.items())):
                     data = cached['geometry']
@@ -269,18 +284,29 @@ class GlomapPipeline:
                         for key, value in data.items()}
                 data['matches'] = Matches(data.pop('indices'), data.pop('scores'))
                 geometry = TwoViewGeometry(**data)
+                geometries[i, j] = geometry
             else:
-                geometry = verify_two_view(frame0.keypoints_2d.to(device), frame1.keypoints_2d.to(device),
-                    matches, matrices[i], matrices[j], self.cfg.two_view, (sizes[i], sizes[j]))
-                if self.cfg.use_cache:
-                    data = {key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
-                            for key, value in vars(geometry).items() if key != 'matches'}
-                    data['indices'] = geometry.matches.indices.cpu()
-                    data['scores'] = geometry.matches.scores.cpu()
-                    self.cache.save('two_view', {'version': 2, 'options': options,
-                                    'sizes': (sizes[i], sizes[j]), 'inputs': inputs, 'geometry': data}, key)
-            geometries[i, j] = geometry
-        return geometries
+                capacity = 1 << max(3, (len(matches.indices) - 1).bit_length())
+                pending.setdefault(capacity, []).append((i, j, key, inputs, matches))
+        for bucket in pending.values():
+            for start in tqdm(range(0, len(bucket), self.cfg.two_view.pair_batch_size), desc='Verify batches'):
+                chunk = bucket[start:start + self.cfg.two_view.pair_batch_size]
+                pair0, pair1 = [p[0] for p in chunk], [p[1] for p in chunk]
+                results = verify_two_view_batch(
+                    [frames[i].keypoints_2d.to(device) for i in pair0],
+                    [frames[j].keypoints_2d.to(device) for j in pair1], [p[4] for p in chunk],
+                    matrices[pair0], matrices[pair1], self.cfg.two_view,
+                    [(sizes[i], sizes[j]) for i, j, *_ in chunk])
+                for (i, j, key, inputs, _), geometry in zip(chunk, results):
+                    geometries[i, j] = geometry
+                    if self.cfg.use_cache:
+                        data = {key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+                                for key, value in vars(geometry).items() if key != 'matches'}
+                        data['indices'] = geometry.matches.indices.cpu()
+                        data['scores'] = geometry.matches.scores.cpu()
+                        self.cache.save('two_view', {'version': 3, 'options': options,
+                            'sizes': (sizes[i], sizes[j]), 'inputs': inputs, 'geometry': data}, key)
+        return {pair: geometries[pair] for pair in correspondences}
 
     @timer
     def get_rotations(self, geometries: dict):
@@ -297,13 +323,13 @@ class GlomapPipeline:
             self.cfg.bundle_adjustment, rotations.edges)
 
     @timer
-    def visualize(self, output_path: Path | None = None, *, max_points=100000, camera_scale=None):
+    def visualize(self, output_path: Path | None = None, *, max_points=100000, camera_scale=None, view_up='auto'):
         from torch_sfm.visualization import visualize_reconstruction
         source = self.result if hasattr(self, 'result') else self.workspace / 'reconstruction.pt'
         image_paths = [frame.frame_path for frame in self.frames] or self.image_list
         return visualize_reconstruction(source, output_path or self.workspace / 'reconstruction.html',
             image_paths=image_paths, colmap_path=self.workspace / 'sparse' / '0',
-            max_points=max_points, camera_scale=camera_scale)
+            max_points=max_points, camera_scale=camera_scale, view_up=view_up)
 
     @timer
     def load_frames(self):
@@ -322,6 +348,7 @@ class GlomapPipeline:
         retrieval_pairs = self.get_retrieval_pairs()
         self.get_keypoints(self.frames)
         correspondences = self.get_correspondences(self.frames, retrieval_pairs)
+        self.prepare_verification()
         geometries = self.get_two_view_geometries(self.frames, correspondences, intrinsic)
         rotations = self.get_rotations(geometries)
         positions = self.get_positions(rotations.edges, rotations.rotations, intrinsic)
@@ -368,11 +395,13 @@ class GlomapPipeline:
 
 if __name__ == '__main__':
     cfg = GlomapConfig(
-        retrieval_top_k=5
+        retrieval_top_k=10
     )
-    data_path = Path('/root/autodl-tmp/torch_sfm/data/sfm')
+    data_path = Path('/root/autodl-tmp/data/sfm_data/south-building-1920x1080')
     pipeline = GlomapPipeline(cfg, data_path)
+
     result = pipeline.run()
+    pipeline.visualize()
     print(f'{int(result.registered.sum())}/{len(result.registered)} registered images, '
           f'{len(result.points3d)} points')
     timer.report()

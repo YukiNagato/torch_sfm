@@ -3,8 +3,8 @@
 from html import escape
 from pathlib import Path
 
-from PIL import Image
 import torch
+from PIL import Image
 
 from ..geometry.two_view import camera_matrix
 
@@ -26,6 +26,57 @@ def _ranges(values):
     extent = (high - low).amax().clamp_min(1e-3)
     padding = torch.maximum((high - low) * .08, extent * .02)
     return torch.stack((low - padding, high + padding), -1).tolist()
+
+
+def _aspect_ratio(bounds):
+    """Equal world-unit scale even when the displayed bounds crop outliers."""
+    spans = torch.tensor(bounds, dtype=torch.float64).diff(dim=-1).squeeze(-1)
+    spans = spans / spans.prod().pow(1 / 3)
+    return dict(zip('xyz', spans.tolist()))
+
+
+def _view_cameras(rotations, view_up):
+    """Viewing directions only; never rotate the saved or plotted coordinates.
+
+    Image -Y is camera up, so its world direction is -R[1] for world-to-camera R.
+    Averaging camera up is a display heuristic, not a gravity estimate.
+    """
+    basis = rotations[0] if len(rotations) else torch.eye(3, dtype=torch.float64)
+    if len(rotations):
+        ups = torch.nn.functional.normalize(-rotations[:, 1], dim=-1)
+        average = ups.mean(0)
+        auto = average if average.norm() > .25 else ups[0]
+    else:
+        auto = basis[2]
+    vectors = {'auto': auto}
+    for index, axis in enumerate('xyz'):
+        direction = torch.eye(3, dtype=torch.float64)[index]
+        vectors[axis], vectors['-' + axis] = direction, -direction
+    if isinstance(view_up, str):
+        if view_up not in vectors:
+            raise ValueError('view_up must be auto, x, y, z, -x, -y, -z or a 3-vector')
+        selected = view_up
+    else:
+        direction = _cpu(view_up)
+        if direction.shape != (3,) or not torch.isfinite(direction).all() or direction.norm() <= 1e-12:
+            raise ValueError('view_up must be a finite nonzero 3-vector')
+        vectors['custom'] = direction
+        selected = 'custom'
+    cameras = {}
+    for name, direction in vectors.items():
+        up = direction / direction.norm()
+        backward = -basis[2]
+        backward = backward - torch.dot(backward, up) * up
+        if backward.norm() < 1e-8:
+            # Looking along up makes orbit/roll undefined. Use another camera axis.
+            fallback = basis[torch.argmin((basis @ up).abs())]
+            backward = fallback - torch.dot(fallback, up) * up
+        backward = backward / backward.norm()
+        right = torch.linalg.cross(up, backward)
+        eye = 1.4 * right + up + 1.8 * backward
+        cameras[name] = {'eye': dict(zip('xyz', eye.tolist())),
+                         'up': dict(zip('xyz', up.tolist()))}
+    return cameras, selected
 
 
 def _segments(vertices, edges):
@@ -57,11 +108,13 @@ def _colmap_colors(folder, points):
 
 @torch.no_grad()
 def build_figure(result, *, colors=None, image_paths=None, image_sizes=None,
-                 camera_scale=None, max_points=100000):
+                 camera_scale=None, max_points=100000, view_up='auto'):
     """Return a Plotly figure. R is world-to-camera and centers are world xyz.
 
     image_sizes are (height, width). Missing image files use an approximate
     centered sensor size inferred from K. All frustums use original-image K.
+    view_up chooses the display up direction only; auto uses the cameras' mean
+    image-up direction (or world Z if no camera is registered).
     """
     go = _plotly()
     data = result if isinstance(result, dict) else vars(result)
@@ -164,23 +217,26 @@ def build_figure(result, *, colors=None, image_paths=None, image_sizes=None,
         subject = cloud
     subject = _ranges(torch.cat((subject, vertices)))
     camera_bounds = _ranges(vertices) if len(vertices) else full
-    initial_camera = {'eye': {'x': 1.4, 'y': -1.0, 'z': -1.8}, 'up': {'x': 0, 'y': -1, 'z': 0}}
+    view_cameras, selected_up = _view_cameras(rotations[camera_ids], view_up)
+    initial_camera = view_cameras[selected_up]
     axis_style = {'showbackground': False, 'gridcolor': '#233247', 'zerolinecolor': '#405066'}
     figure.update_layout(template='plotly_dark', paper_bgcolor='#0b1220', plot_bgcolor='#0b1220',
         margin={'l': 0, 'r': 0, 't': 0, 'b': 0}, showlegend=False, autosize=True,
-        scene={'aspectmode': 'data', 'dragmode': 'orbit', 'camera': initial_camera,
+        scene={'aspectmode': 'manual', 'aspectratio': _aspect_ratio(subject),
+               'dragmode': 'orbit', 'camera': initial_camera,
                'xaxis': dict(axis_style, title='X', range=subject[0]),
                'yaxis': dict(axis_style, title='Y', range=subject[1]),
                'zaxis': dict(axis_style, title='Z', range=subject[2])},
         meta={'points_total': int(finite.sum()), 'points_shown': len(cloud), 'cameras': len(camera_ids),
               'camera_scale': camera_scale, 'bounds': {'subject': subject, 'full': full, 'cameras': camera_bounds},
-              'initial_camera': initial_camera, 'trace_groups': {'points': [0], 'cameras': [1, 2],
+              'initial_camera': initial_camera, 'view_cameras': view_cameras, 'view_up': selected_up,
+              'trace_groups': {'points': [0], 'cameras': [1, 2],
                                                                'trajectory': [3], 'axes': [4, 5, 6]}})
     return figure
 
 
 def visualize_reconstruction(source, output_path=None, *, colors=None, image_paths=None, image_sizes=None,
-                              camera_scale=None, max_points=100000, colmap_path=None):
+                              camera_scale=None, max_points=100000, colmap_path=None, view_up='auto'):
     """Write a self-contained HTML viewer and return its Path.
 
     source accepts a workspace, .pt checkpoint, dict or GlomapResult. Plotly is
@@ -203,7 +259,7 @@ def visualize_reconstruction(source, output_path=None, *, colors=None, image_pat
     if colors is None and data.get('colors') is None and colmap_path is not None:
         colors = _colmap_colors(colmap_path, _cpu(data['points3d']))
     figure = build_figure(data, colors=colors, image_paths=image_paths, image_sizes=image_sizes,
-                          camera_scale=camera_scale, max_points=max_points)
+                          camera_scale=camera_scale, max_points=max_points, view_up=view_up)
     from .template import html_page
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_page(figure), encoding='utf-8')

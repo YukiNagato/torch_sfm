@@ -1,8 +1,9 @@
-"""Pinhole two-view verification using tensor-only LO-RANSAC.
+"""Pinhole two-view verification using Torch and optional Warp LO-RANSAC.
 
 Conventions follow COLMAP: x2.T E x1 = 0 and X2 = R X1 + t.
-Five-point estimation uses the essential variety's cubic constraints and a
-10-by-10 action matrix; no external geometry solver is used.
+Five-point estimation uses the essential variety's cubic constraints. The
+reference uses a 10x10 action matrix; CUDA can use polynomial elimination and
+Sturm real roots. No external geometry solver is called.
 """
 
 from dataclasses import dataclass
@@ -21,7 +22,10 @@ class TwoViewConfig:
     confidence: float = 0.999
     min_trials: int = 100
     max_trials: int = 10000
-    batch_size: int = 32
+    batch_size: int = 240  # hypotheses per pair; measured on RTX 4090 D (issues/009)
+    pair_batch_size: int = 64
+    backend: str = 'auto'  # Warp scoring and five-point real roots on CUDA, otherwise Torch
+    pose_cuda_graph: bool = False  # opt in for repeatedly reused shapes; capture has startup cost
     min_num_inliers: int = 15
     min_inlier_ratio: float = 0.0
     min_E_F_inlier_ratio: float = 0.95
@@ -38,8 +42,10 @@ class TwoViewConfig:
             raise ValueError('max_error must be finite and positive')
         if not 0 < self.confidence < 1 or not 0 < self.min_trials <= self.max_trials:
             raise ValueError('Invalid RANSAC confidence or trial limits')
-        if self.batch_size < 1 or self.min_num_inliers < 5:
+        if self.batch_size < 1 or self.pair_batch_size < 1 or self.min_num_inliers < 5:
             raise ValueError('batch_size must be positive and min_num_inliers >= 5')
+        if self.backend not in ('auto', 'torch', 'warp'):
+            raise ValueError('Two-view backend must be auto, torch or warp')
         for ratio in (self.min_inlier_ratio, self.min_E_F_inlier_ratio,
                       self.max_H_inlier_ratio, self.watermark_min_inlier_ratio):
             if not 0 <= ratio <= 1:
@@ -114,7 +120,7 @@ _CUBIC_INDICES = [_MONOMIALS.index(tuple(sum(v[d] for v in terms) for d in range
                   for terms in product(_LINEAR, repeat=3)]
 
 
-def essential_five_point(points0, points1):
+def essential_five_point(points0, points1, return_owners=False, backend='torch'):
     """Batched minimal solver; return all finite, real essential matrices."""
     design = _epipolar_design(points0, points1)
     _, singular, vh = torch.linalg.svd(design, full_matrices=True)
@@ -132,58 +138,99 @@ def essential_five_point(points0, points1):
     raw = torch.cat((cubics.reshape(-1, 9, 64), determinant.reshape(-1, 1, 64)), 1)
     indices = torch.tensor(_CUBIC_INDICES, device=raw.device).expand_as(raw)
     coefficients = raw.new_zeros((len(raw), 10, 20)).scatter_add_(2, indices, raw)
+    if points0.is_cuda and points0.dtype == torch.float64 and backend != 'torch':
+        try:
+            from .five_point import essential_from_constraints
+            from . import warp_roots
+        except ImportError:
+            if backend == 'warp':
+                raise
+        else:
+            return essential_from_constraints(points0, points1, coefficients, basis, singular, return_owners)
     reduction, info = torch.linalg.solve_ex(coefficients[:, :, :10], -coefficients[:, :, 10:])
     valid = ((info == 0) & (singular[:, -1] > 1e-10 * singular[:, 0])
              & torch.isfinite(reduction).all(dim=(-2, -1)))
     reduction = reduction[valid]
     basis = basis[valid]
+    owners = torch.arange(len(points0), device=points0.device)[valid]
     if len(basis) == 0:
-        return points0.new_empty((0, 3, 3))
+        models = points0.new_empty((0, 3, 3))
+        return (models, owners) if return_owners else models
     action = reduction.new_zeros((len(reduction), 10, 10))
     action[:, :6] = reduction[:, 4:10]
     action[:, 6, 3] = action[:, 7, 4] = action[:, 8, 5] = action[:, 9, 8] = 1
-    eigenvalues, eigenvectors = torch.linalg.eig(action)
-    vectors = eigenvectors.transpose(-1, -2)
-    valid = ((eigenvalues.imag.abs() < 1e-7 * (1 + eigenvalues.real.abs()))
-             & (vectors[..., 9].abs() > 1e-10))
-    xyz = (vectors[..., 6:9] / vectors[..., 9:10]).real
-    coordinates = torch.cat((xyz, torch.ones_like(xyz[..., :1])), -1)
-    models = torch.einsum('bijp,bkp->bkij', basis, coordinates)[valid]
+    eigenvalues = torch.linalg.eigvals(action)
+    valid = eigenvalues.imag.abs() < 1e-7 * (1 + eigenvalues.real.abs())
+    sample_ids = torch.arange(len(action), device=action.device)[:, None].expand_as(valid)[valid]
+    roots = eigenvalues.real[valid]
+    # Only the last four eigenvector entries are needed. Fix v[9]=1 and
+    # reconstruct via a batched 9x9 solve, avoiding general eigenvectors.
+    selected = action[sample_ids]
+    eye = torch.eye(9, dtype=action.dtype, device=action.device)
+    vectors, info = torch.linalg.solve_ex(selected[:, :9, :9] - roots[:, None, None] * eye,
+                                         -selected[:, :9, 9])
+    coordinates = torch.cat((vectors[:, 6:9], torch.ones_like(vectors[:, :1])), -1)
+    models = torch.einsum('bijp,bp->bij', basis[sample_ids], coordinates)
+    owners = owners[sample_ids]
     models = F.normalize(models.flatten(-2), dim=-1).reshape(-1, 3, 3)
     eet = models @ models.transpose(-1, -2)
     error = 2 * eet @ models - eet.diagonal(dim1=-2, dim2=-1).sum(-1)[:, None, None] * models
-    return models[torch.isfinite(models).all(dim=(-2, -1)) & (error.norm(dim=(-2, -1)) < 1e-5)]
+    valid = (info == 0) & torch.isfinite(models).all(dim=(-2, -1)) & (error.norm(dim=(-2, -1)) < 1e-5)
+    return (models[valid], owners[valid]) if return_owners else models[valid]
 
 
-def fundamental_seven_point(points0, points1):
+def _cubic_real_roots(coefficients):
+    """Three root slots with validity, without a general 3x3 eigensolver."""
+    c, b, a = (coefficients[:, :3] / coefficients[:, 3:]).unbind(-1)
+    p, q = b - a.square() / 3, 2 * a.pow(3) / 27 - a * b / 3 + c
+    discriminant = (q / 2).square() + (p / 3).pow(3)
+    multiple = discriminant.abs() <= 1e-14 * (
+        (q / 2).square() + (p / 3).pow(3).abs()).clamp_min(1e-30)
+    value = -q / 2 - torch.copysign(discriminant.clamp_min(0).sqrt(), q)
+    u = value.sign() * value.abs().pow(1 / 3)
+    v = torch.where(u.abs() > 1e-15, -p / (3 * u), torch.zeros_like(u))
+    one_root = u + v - a / 3
+    radius = (-p / 3).clamp_min(1e-30).sqrt()
+    angle = torch.acos((-q / (2 * radius.pow(3))).clamp(-1, 1)) / 3
+    offsets = coefficients.new_tensor([0, 2 * math.pi / 3, 4 * math.pi / 3])
+    roots = 2 * radius[:, None] * torch.cos(angle[:, None] - offsets) - a[:, None] / 3
+    roots = torch.where((discriminant >= 0)[:, None], one_root[:, None], roots)
+    repeated = (-u - a / 3)[:, None].expand_as(roots)
+    slots = torch.arange(3, device=roots.device)[None]
+    roots = torch.where(multiple[:, None] & (slots > 0), repeated, roots)
+    valid = (discriminant < 0)[:, None] | (slots == 0) | multiple[:, None]
+    for _ in range(2):
+        value = ((roots + a[:, None]) * roots + b[:, None]) * roots + c[:, None]
+        derivative = (3 * roots + 2 * a[:, None]) * roots + b[:, None]
+        roots = roots - torch.where(derivative.abs() > 1e-15, value / derivative, 0)
+    return roots, valid & torch.isfinite(roots)
+
+
+def fundamental_seven_point(points0, points1, return_owners=False):
     normalized0, transform0 = normalize_points(points0)
     normalized1, transform1 = normalize_points(points1)
     design = _epipolar_design(normalized0, normalized1)
     _, singular, vh = torch.linalg.svd(design, full_matrices=design.shape[-2] < 9)
     basis = vh[:, -2:].reshape(-1, 2, 3, 3)
-    coefficients = points0.new_zeros((len(points0), 4))
-    # det(A + lambda B), in ascending powers of lambda.
-    for cols, sign in (((0, 1, 2), 1), ((1, 2, 0), 1), ((2, 0, 1), 1),
-                       ((0, 2, 1), -1), ((1, 0, 2), -1), ((2, 1, 0), -1)):
-        for powers in product(range(2), repeat=3):
-            coefficients[:, sum(powers)] += sign * (
-                basis[:, powers[0], 0, cols[0]] * basis[:, powers[1], 1, cols[1]]
-                * basis[:, powers[2], 2, cols[2]])
+    a0, a1, a2 = basis[:, 0].unbind(-2)
+    b0, b1, b2 = basis[:, 1].unbind(-2)
+    cross_aa, cross_bb = torch.linalg.cross(a1, a2), torch.linalg.cross(b1, b2)
+    cross_ab = torch.linalg.cross(a1, b2) + torch.linalg.cross(b1, a2)
+    coefficients = torch.stack(((a0 * cross_aa).sum(-1),
+        (b0 * cross_aa + a0 * cross_ab).sum(-1),
+        (a0 * cross_bb + b0 * cross_ab).sum(-1), (b0 * cross_bb).sum(-1)), -1)
     valid = ((coefficients[:, 3].abs() > 1e-12)
              & (singular[:, -1] > 1e-10 * singular[:, 0]))
     coefficients, basis = coefficients[valid], basis[valid]
+    owners = torch.arange(len(points0), device=points0.device)[valid]
     if len(basis) == 0:
-        return points0.new_empty((0, 3, 3))
-    companion = coefficients.new_zeros((len(coefficients), 3, 3))
-    companion[:, 0, 2] = -coefficients[:, 0] / coefficients[:, 3]
-    companion[:, 1, 2] = -coefficients[:, 1] / coefficients[:, 3]
-    companion[:, 2, 2] = -coefficients[:, 2] / coefficients[:, 3]
-    companion[:, 1, 0] = companion[:, 2, 1] = 1
-    roots = torch.linalg.eigvals(companion)
-    models = basis[:, None, 0] + roots.real[..., None, None] * basis[:, None, 1]
+        models = points0.new_empty((0, 3, 3))
+        return (models, owners) if return_owners else models
+    roots, real = _cubic_real_roots(coefficients)
+    models = basis[:, None, 0] + roots[..., None, None] * basis[:, None, 1]
     models = transform1[valid, None].transpose(-1, -2) @ models @ transform0[valid, None]
-    models = models[roots.imag.abs() < 1e-7 * (1 + roots.real.abs())]
-    return F.normalize(models.flatten(-2), dim=-1).reshape(-1, 3, 3)
+    models = F.normalize(models[real].flatten(-2), dim=-1).reshape(-1, 3, 3)
+    return (models, owners[:, None].expand_as(real)[real]) if return_owners else models
 
 
 def epipolar_eight_point(points0, points1, essential=False):
@@ -200,7 +247,7 @@ def epipolar_eight_point(points0, points1, essential=False):
     return matrix[singular[..., -2] > 1e-10 * singular[..., 0]]
 
 
-def homography_dlt(points0, points1):
+def homography_dlt(points0, points1, return_owners=False):
     normalized0, transform0 = normalize_points(points0)
     normalized1, transform1 = normalize_points(points1)
     xy1 = homogeneous(normalized0)
@@ -211,7 +258,8 @@ def homography_dlt(points0, points1):
     _, singular, vh = torch.linalg.svd(design, full_matrices=design.shape[-2] < 9)
     matrix = torch.linalg.solve(transform1, vh[..., -1, :].reshape(-1, 3, 3) @ transform0)
     rank = singular[..., 7] > 1e-10 * singular[..., 0]
-    return matrix[rank & (torch.linalg.det(matrix).abs() > 1e-12)]
+    valid = rank & (torch.linalg.det(matrix).abs() > 1e-12)
+    return (matrix[valid], torch.arange(len(points0), device=points0.device)[valid]) if return_owners else matrix[valid]
 
 
 def sampson_error(models, points0, points1):
@@ -347,27 +395,11 @@ def _choose_pose(poses, rays0, rays1):
 
 
 @torch.inference_mode(False)
-def _refine_pose(rotation, translation, pixels0, pixels1, matrix0, matrix1):
-    from .averaging import SO3Var, UnitDirectionVar
-    from torchls import Problem, TerminationConfig
-    from torchls.geometry import skew
-
-    def residual(r, t, x0, x1, inverse0, inverse1):
-        fundamental = inverse1.T @ skew(t) @ r @ inverse0
-        line1, line0 = fundamental @ x0, fundamental.T @ x1
-        denominator = (line0[:2].square().sum() + line1[:2].square().sum()).clamp_min(1e-20).sqrt()
-        return ((x1 @ line1) / denominator).reshape(1)
-
-    problem = Problem({'rotation': rotation[None].clone(), 'direction': translation[None].clone()},
-                      manifolds={'rotation': SO3Var, 'direction': UnitDirectionVar})
-    observation_ids = torch.zeros(len(pixels0), dtype=torch.long, device=pixels0.device)
-    problem.add_residual(residual, ('rotation', observation_ids), ('direction', observation_ids),
-        homogeneous(pixels0).clone(), homogeneous(pixels1).clone(),
-        torch.linalg.inv(matrix0)[None].clone(), torch.linalg.inv(matrix1)[None].clone(), batch_size=1024)
-    solved, summary = problem.solve(termination=TerminationConfig(max_iterations=15), return_summary=True)
-    if not math.isfinite(summary.final_cost):
-        return rotation, translation
-    return solved['rotation'][0], solved['direction'][0]
+def _refine_pose(rotation, translation, pixels0, pixels1, matrix0, matrix1, use_cuda_graph=True, backend='auto'):
+    from .relative_pose import refine_relative_pose
+    rotations, translations = refine_relative_pose(rotation[None], translation[None],
+        pixels0[None], pixels1[None], matrix0[None], matrix1[None], use_cuda_graph=use_cuda_graph, backend=backend)
+    return rotations[0], translations[0]
 
 
 def _watermark(points0, points1, image_sizes, cfg):
@@ -431,7 +463,8 @@ def verify_two_view(keypoints0, keypoints1, matches, intrinsics0, intrinsics1,
     if essential is not None and cfg.refine_relative_pose and int(mask_e.sum()) >= cfg.min_num_inliers:
         r, t, positive, _ = _choose_pose(essential_poses(essential), rays0[mask_e], rays1[mask_e])
         if int(positive.sum()) >= cfg.min_num_inliers:
-            r, t = _refine_pose(r, t, points0[mask_e][positive], points1[mask_e][positive], matrix0, matrix1)
+            r, t = _refine_pose(r, t, points0[mask_e][positive], points1[mask_e][positive],
+                matrix0, matrix1, cfg.pose_cuda_graph, cfg.backend)
             from torchls.geometry import skew
             candidate = skew(t) @ r
             old_error = sampson_error((inverse1.T @ essential @ inverse0)[None], points0, points1)[0]
@@ -471,7 +504,7 @@ def verify_two_view(keypoints0, keypoints1, matches, intrinsics0, intrinsics1,
     rotation, translation, positive, angle = _choose_pose(poses, rays0[mask], rays1[mask])
     if result.config == 'CALIBRATED' and cfg.refine_relative_pose and int(positive.sum()) >= minimum:
         rotation, translation = _refine_pose(rotation, translation, points0[mask][positive],
-            points1[mask][positive], matrix0, matrix1)
+            points1[mask][positive], matrix0, matrix1, cfg.pose_cuda_graph, cfg.backend)
     if result.config == 'CALIBRATED':
         from torchls.geometry import skew
         result.E = skew(translation) @ rotation
