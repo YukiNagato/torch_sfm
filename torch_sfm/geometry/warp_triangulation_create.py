@@ -195,10 +195,13 @@ def _score(
     errors[b, h] = error_sum
 
 
-@wp.kernel
-def _solve_score(
+@wp.func
+def _solve_score_pair(
     nodes: wp.array2d(dtype=wp.int64),
-    pairs: wp.array2d(dtype=wp.int64),
+    b: int,
+    h: int,
+    left: int,
+    right: int,
     poses: wp.array3d(dtype=wp.float64),
     frame: wp.array(dtype=wp.int64),
     valid: wp.array(dtype=wp.bool),
@@ -213,10 +216,9 @@ def _solve_score(
     counts: wp.array2d(dtype=wp.int64),
     errors: wp.array2d(dtype=wp.float64),
 ):
-    b, h = wp.tid()
     matrix = wp.mat44d()
     for side in range(2):
-        node = wp.max(nodes[b, pairs[h, side]], wp.int64(0))
+        node = wp.max(nodes[b, left if side == 0 else right], wp.int64(0))
         fid = frame[node]
         for r in range(2):
             uv = rays[node, r] / rays[node, 2]
@@ -232,7 +234,7 @@ def _solve_score(
     x = wp.vec3d(vector[0], vector[1], vector[2]) / denom
     for c in range(3):
         xyz[b, h, c] = x[c]
-    a, d = nodes[b, pairs[h, 0]], nodes[b, pairs[h, 1]]
+    a, d = nodes[b, left], nodes[b, right]
     stable = False
     if homogeneous and a >= wp.int64(0) and d >= wp.int64(0):
         stable = (
@@ -253,6 +255,122 @@ def _solve_score(
 
 
 @wp.kernel
+def _solve_score(
+    nodes: wp.array2d(dtype=wp.int64),
+    pairs: wp.array2d(dtype=wp.int64),
+    poses: wp.array3d(dtype=wp.float64),
+    frame: wp.array(dtype=wp.int64),
+    valid: wp.array(dtype=wp.bool),
+    rays: wp.array2d(dtype=wp.float64),
+    xy: wp.array2d(dtype=wp.float64),
+    rotations: wp.array3d(dtype=wp.float64),
+    centers: wp.array2d(dtype=wp.float64),
+    calibration: wp.array2d(dtype=wp.float64),
+    angle: wp.float64,
+    cosine: wp.float64,
+    xyz: wp.array3d(dtype=wp.float64),
+    counts: wp.array2d(dtype=wp.int64),
+    errors: wp.array2d(dtype=wp.float64),
+):
+    b, h = wp.tid()
+    left = wp.int32(pairs[h, 0])
+    right = wp.int32(pairs[h, 1])
+    _solve_score_pair(
+        nodes,
+        b,
+        h,
+        left,
+        right,
+        poses,
+        frame,
+        valid,
+        rays,
+        xy,
+        rotations,
+        centers,
+        calibration,
+        angle,
+        cosine,
+        xyz,
+        counts,
+        errors,
+    )
+
+
+@wp.kernel
+def _solve_score_range(
+    nodes: wp.array2d(dtype=wp.int64),
+    lengths: wp.array(dtype=wp.int64),
+    trials: wp.array(dtype=wp.int64),
+    start: int,
+    needed: wp.array(dtype=wp.int64),
+    exhaustive_threshold: int,
+    hypothesis_batch: int,
+    poses: wp.array3d(dtype=wp.float64),
+    frame: wp.array(dtype=wp.int64),
+    valid: wp.array(dtype=wp.bool),
+    rays: wp.array2d(dtype=wp.float64),
+    xy: wp.array2d(dtype=wp.float64),
+    rotations: wp.array3d(dtype=wp.float64),
+    centers: wp.array2d(dtype=wp.float64),
+    calibration: wp.array2d(dtype=wp.float64),
+    angle: wp.float64,
+    cosine: wp.float64,
+    xyz: wp.array3d(dtype=wp.float64),
+    counts: wp.array2d(dtype=wp.int64),
+    errors: wp.array2d(dtype=wp.float64),
+):
+    b, h = wp.tid()
+    ordinal = start + h
+    skip = wp.bool(False)
+    if needed.shape[0] > 0:
+        if lengths[b] <= wp.int64(exhaustive_threshold):
+            # Exhaustive rows evaluate every pair in round zero, even while
+            # adaptive rows in the same launch evaluate just their next chunk.
+            ordinal = h
+            skip = start > 0
+        else:
+            skip = h >= hypothesis_batch or wp.int64(start) >= needed[b]
+    if skip or wp.int64(ordinal) >= trials[b]:
+        counts[b, h] = wp.int64(-1)
+        errors[b, h] = wp.float64(wp.inf)
+        for c in range(3):
+            xyz[b, h, c] = wp.float64(0.0)
+        return
+    length = wp.int32(lengths[b])
+    left = wp.int32(0)
+    # Unrank the lexicographic (i,j), i<j pair in this row's real-length track.
+    remainder = wp.int32(ordinal)
+    while remainder >= length - left - 1:
+        remainder -= length - left - 1
+        left += 1
+    right = left + 1 + remainder
+    offset = nodes.shape[1] - length
+    left += offset
+    right += offset
+    _solve_score_pair(
+        nodes,
+        b,
+        h,
+        left,
+        right,
+        poses,
+        frame,
+        valid,
+        rays,
+        xy,
+        rotations,
+        centers,
+        calibration,
+        angle,
+        cosine,
+        xyz,
+        counts,
+        errors,
+    )
+
+
+@wp.kernel
 def _choose(
     nodes: wp.array2d(dtype=wp.int64),
     proposed: wp.array3d(dtype=wp.float64),
@@ -267,6 +385,9 @@ def _choose(
     adaptive: int,
     start: int,
     trials: int,
+    trial_caps: wp.array(dtype=wp.int64),
+    mixed_lengths: wp.array(dtype=wp.int64),
+    exhaustive_threshold: int,
     log_failure: wp.float64,
     xyz: wp.array2d(dtype=wp.float64),
     inside: wp.array2d(dtype=wp.bool),
@@ -303,7 +424,10 @@ def _choose(
         best_count[b] = nc
         best_error[b] = ne
     active[b] = nc > wp.int64(2)
-    if adaptive != 0:
+    is_adaptive = adaptive != 0
+    if mixed_lengths.shape[0] > 0:
+        is_adaptive = mixed_lengths[b] > wp.int64(exhaustive_threshold)
+    if is_adaptive:
         total = wp.int64(0)
         for k in range(nodes.shape[1]):
             node = nodes[b, k]
@@ -315,7 +439,14 @@ def _choose(
         )
         prob = wp.clamp(prob, wp.float64(1e-12), wp.float64(1.0 - 1e-12))
         budget = wp.ceil(log_failure / wp.log(wp.float64(1.0) - prob))
-        needed[b] = wp.int64(wp.clamp(budget, wp.float64(1.0), wp.float64(trials)))
+        cap = wp.float64(trials)
+        if trial_caps.shape[0] > 0:
+            cap = wp.float64(trial_caps[b])
+        needed[b] = wp.int64(wp.clamp(budget, wp.float64(1.0), cap))
+    elif mixed_lengths.shape[0] > 0:
+        # All hypotheses for this short row were evaluated in round zero.
+        # Keep its refinement flag, but exclude it from subsequent pair rounds.
+        needed[b] = wp.int64(0)
 
 
 @wp.kernel
@@ -431,7 +562,7 @@ def _finish(inside: wp.array2d(dtype=wp.bool), counts: wp.array(dtype=wp.int64))
         inside[b, k] = False
 
 
-def estimate(tri, nodes, *, fused=True):
+def estimate(tri, nodes, *, fused=True, lengths=None, mixed=False):
     """Same hypothesis schedule; fused SVD/scoring or the Torch SVD reference."""
     s = tri.storage
     b, width = nodes.shape
@@ -439,6 +570,8 @@ def estimate(tri, nodes, *, fused=True):
     inside = torch.zeros_like(nodes, dtype=torch.bool)
     if b == 0 or width < 2:
         return xyz, inside
+    if mixed and (lengths is None or not fused):
+        raise ValueError("Mixed-length estimation requires lengths and fused Warp")
     pairs = (
         torch.triu_indices(width, width, offset=1, device=nodes.device)
         .T[: tri.config.max_num_trials]
@@ -446,9 +579,20 @@ def estimate(tri, nodes, *, fused=True):
     )
     adaptive = width > tri.config.exhaustive_max_track_length
     step = tri.config.tensor_hypothesis_batch if adaptive else len(pairs)
+    short_width = min(width, tri.config.exhaustive_max_track_length)
+    mixed_slots = max(
+        min(short_width * (short_width - 1) // 2, tri.config.max_num_trials),
+        min(step, len(pairs)),
+    )
     best_count = nodes.new_zeros(b)
     best_error = s.xy.new_full((b,), math.inf)
-    needed = nodes.new_full((b,), len(pairs))
+    if lengths is None:
+        needed = nodes.new_full((b,), len(pairs))
+    else:
+        if not fused:
+            raise ValueError("Range buckets require the fused Warp estimator")
+        trials = (lengths * (lengths - 1) // 2).clamp(max=tri.config.max_num_trials)
+        needed = trials.clone()
     active = torch.zeros(b, dtype=torch.bool, device=nodes.device)
     stream = wp.stream_from_torch(torch.cuda.current_stream(nodes.device))
     arrays = {
@@ -471,6 +615,10 @@ def estimate(tri, nodes, *, fused=True):
             "active": active,
         }.items()
     }
+
+    if lengths is not None:
+        arrays["lengths"] = wp.from_torch(lengths)
+        arrays["trials"] = wp.from_torch(trials)
 
     def arr(*names):
         return [arrays[name] for name in names]
@@ -495,15 +643,29 @@ def estimate(tri, nodes, *, fused=True):
                 stream=stream,
             )
             _, _, vh = torch.linalg.svd(matrices)
-        candidates = s.xy.new_empty(b, len(p), 3)
-        counts = nodes.new_empty(b, len(p))
-        errors = s.xy.new_empty(b, len(p))
+        slots = mixed_slots if mixed else len(p)
+        candidates = s.xy.new_empty(b, slots, 3)
+        counts = nodes.new_empty(b, slots)
+        errors = s.xy.new_empty(b, slots)
         wp.launch(
-            _solve_score if fused else _score,
-            dim=(b, len(p)),
+            (_solve_score if lengths is None else _solve_score_range)
+            if fused
+            else _score,
+            dim=(b, slots),
             inputs=[
                 arrays["nodes"],
-                wp.from_torch(p),
+                *(
+                    [wp.from_torch(p)]
+                    if lengths is None
+                    else [
+                        arrays["lengths"],
+                        arrays["trials"],
+                        start,
+                        arrays["needed"] if mixed else None,
+                        tri.config.exhaustive_max_track_length,
+                        tri.config.tensor_hypothesis_batch,
+                    ]
+                ),
                 arrays["poses"] if fused else wp.from_torch(vh),
                 *arr(
                     "frame",
@@ -531,6 +693,9 @@ def estimate(tri, nodes, *, fused=True):
                 int(adaptive),
                 start,
                 len(pairs),
+                None if lengths is None else arrays["trials"],
+                arrays["lengths"] if mixed else None,
+                tri.config.exhaustive_max_track_length,
                 3 * math.log1p(-tri.config.confidence),
                 *arr("xyz", "inside", "best_count", "best_error", "needed", "active"),
             ],

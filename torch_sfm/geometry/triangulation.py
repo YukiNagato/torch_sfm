@@ -69,6 +69,7 @@ class TriangulationConfig:
     speculative_min_queries: int = 128
     tensor_hypothesis_batch: int = 32
     tensor_create_backend: str = "auto"
+    tensor_create_bucketing: str = "none"
     tensor_merge_backend: str = "auto"
     tensor_merge_matching: str = "maximal"
     tensor_merge_cache: bool = True
@@ -82,6 +83,8 @@ class TriangulationConfig:
             raise ValueError("tensor_hypothesis_batch must be positive")
         if self.tensor_create_backend not in ("auto", "torch", "warp"):
             raise ValueError("tensor_create_backend must be auto, torch or warp")
+        if self.tensor_create_bucketing not in ("exact", "range", "none"):
+            raise ValueError("tensor_create_bucketing must be exact, range or none")
         if self.tensor_merge_backend not in ("auto", "torch", "warp"):
             raise ValueError("tensor_merge_backend must be auto, torch or warp")
         if self.tensor_merge_matching not in ("mutual", "maximal"):
@@ -170,7 +173,10 @@ class IncrementalTriangulator:
             self.adj.append(set())
         return self.lookup[key]
 
-    def update_geometry(self, rotations, centers, intrinsics):
+    def update_geometry(self, rotations, centers, intrinsics, *, registered=None):
+        """Refresh geometry and optionally camera registration, reusing topology."""
+        if registered is not None:
+            self.active = set(torch.where(registered)[0].tolist())
         self.device, self.dtype = centers.device, centers.dtype
         self.rotations = rotations.detach().cpu().double()
         self.centers = centers.detach().cpu().double()
@@ -486,11 +492,12 @@ class IncrementalTriangulator:
                 break
         return count
 
-    def triangulate(self):
+    def triangulate(self, frame_indices=None):
         added = 0
+        images = self.valid_cameras if frame_indices is None else self.valid_cameras.intersection(frame_indices)
         order = [
             n
-            for image in sorted(self.valid_cameras)
+            for image in sorted(images)
             for n in self.by_image.get(image, [])
         ]
         size = self.config.batch_lookahead if self.candidate_cache else len(order) or 1

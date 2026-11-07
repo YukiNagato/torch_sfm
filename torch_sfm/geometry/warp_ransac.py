@@ -38,12 +38,34 @@ def sample_indices(counts, valid, trial, batch, size, seed):
 def _select(costs: wp.array(dtype=wp.float64), owners: wp.array(dtype=wp.int64),
             candidates: wp.array3d(dtype=wp.float64), active: wp.array(dtype=wp.int64),
             models: wp.array3d(dtype=wp.float64), best_score: wp.array(dtype=wp.float64),
-            found: wp.array(dtype=wp.bool), selected: wp.array(dtype=wp.int64),
-            improved: wp.array(dtype=wp.bool)):
+            found: wp.array(dtype=wp.bool), sorted_owners: int,
+            selected: wp.array(dtype=wp.int64), improved: wp.array(dtype=wp.bool),
+            errors: wp.array2d(dtype=wp.float64), valid: wp.array2d(dtype=wp.bool),
+            threshold: wp.float64, masks: wp.array2d(dtype=wp.bool)):
     pair, lane = wp.tid()
+    first, last = int(0), costs.shape[0]
+    if sorted_owners != 0:
+        # Existing packed minimal solvers already produce contiguous owner
+        # segments. Locate each segment without another allocation or launch.
+        lo, hi = int(0), costs.shape[0]
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if owners[mid] < wp.int64(pair):
+                lo = mid + 1
+            else:
+                hi = mid
+        first = lo
+        hi = costs.shape[0]
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if owners[mid] <= wp.int64(pair):
+                lo = mid + 1
+            else:
+                hi = mid
+        last = lo
     local_cost = wp.float64(wp.inf)
     local_index = wp.int64(costs.shape[0])
-    for index in range(lane, costs.shape[0], BLOCK):
+    for index in range(first + lane, last, BLOCK):
         if owners[index] == wp.int64(pair):
             cost = costs[index]
             if cost < local_cost or (cost == local_cost and wp.int64(index) < local_index):
@@ -53,9 +75,13 @@ def _select(costs: wp.array(dtype=wp.float64), owners: wp.array(dtype=wp.int64),
     if local_cost != minimum:
         local_index = wp.int64(costs.shape[0])
     winner = wp.tile_extract(wp.tile_min(wp.tile(local_index)), 0)
+    target = active[pair]
+    flag = int(0)
     if lane == 0:
-        target = active[pair]
-        accept = winner < wp.int64(costs.shape[0]) and minimum < best_score[target]
+        flag = int(winner < wp.int64(costs.shape[0]) and minimum < best_score[target])
+    # All lanes observe acceptance before lane 0 updates the incumbent.
+    accept = wp.tile_extract(wp.tile_sum(wp.tile(flag)), 0) != 0
+    if lane == 0:
         selected[pair] = winner
         improved[pair] = accept
         found[target] = found[target] or accept
@@ -64,20 +90,9 @@ def _select(costs: wp.array(dtype=wp.float64), owners: wp.array(dtype=wp.int64),
             for row in range(3):
                 for col in range(3):
                     models[target, row, col] = candidates[winner, row, col]
-
-
-@wp.kernel
-def _mask(errors: wp.array2d(dtype=wp.float64), pair_ids: wp.array(dtype=wp.int64),
-          selected: wp.array(dtype=wp.int64), use_selected: int,
-          accepted: wp.array(dtype=wp.bool), threshold: wp.float64,
-          valid: wp.array2d(dtype=wp.bool), masks: wp.array2d(dtype=wp.bool)):
-    pair, point = wp.tid()
-    if accepted[pair]:
-        target = pair_ids[pair]
-        source = wp.int64(pair)
-        if use_selected != 0:
-            source = selected[pair]
-        masks[target, point] = valid[target, point] and errors[source, point] <= threshold
+    if accept:
+        for point in range(lane, masks.shape[1], BLOCK):
+            masks[target, point] = valid[target, point] and errors[winner, point] <= threshold
 
 
 @wp.kernel
@@ -85,17 +100,26 @@ def _local(costs: wp.array(dtype=wp.float64), good: wp.array(dtype=wp.bool),
            candidates: wp.array3d(dtype=wp.float64), pair_ids: wp.array(dtype=wp.int64),
            survivors: wp.array(dtype=wp.int64), models: wp.array3d(dtype=wp.float64),
            best_score: wp.array(dtype=wp.float64), improved: wp.array(dtype=wp.bool),
-           accepted: wp.array(dtype=wp.bool)):
-    pair = wp.tid()
+           accepted: wp.array(dtype=wp.bool), errors: wp.array2d(dtype=wp.float64),
+           valid: wp.array2d(dtype=wp.bool), threshold: wp.float64,
+           masks: wp.array2d(dtype=wp.bool)):
+    pair, lane = wp.tid()
     target = pair_ids[pair]
-    accept = good[pair] and costs[pair] < best_score[target]
-    accepted[pair] = accept
-    improved[survivors[pair]] = accept
+    flag = int(0)
+    if lane == 0:
+        flag = int(good[pair] and costs[pair] < best_score[target])
+    accept = wp.tile_extract(wp.tile_sum(wp.tile(flag)), 0) != 0
+    if lane == 0:
+        accepted[pair] = accept
+        improved[survivors[pair]] = accept
+        if accept:
+            best_score[target] = costs[pair]
+            for row in range(3):
+                for col in range(3):
+                    models[target, row, col] = candidates[pair, row, col]
     if accept:
-        best_score[target] = costs[pair]
-        for row in range(3):
-            for col in range(3):
-                models[target, row, col] = candidates[pair, row, col]
+        for point in range(lane, masks.shape[1], BLOCK):
+            masks[target, point] = valid[target, point] and errors[pair, point] <= threshold
 
 
 @wp.func_native('return log1pf(x);')
@@ -141,26 +165,34 @@ class State:
         self.threshold = wp.float64(cfg.max_error ** 2)
         self.log_failure = wp.float32(math.log1p(-cfg.confidence))
         self.min_trials, self.max_trials = wp.int64(cfg.min_trials), wp.int64(cfg.max_trials)
+        # Prefixes are active for one round at a time. Masks and model outputs
+        # keep their independent storage; only internal transient flags reuse.
+        self.selected = torch.empty_like(sizes)
+        self.improved = torch.empty_like(found)
+        self.accepted = torch.empty_like(found)
+        self.winner_view, self.improved_view, self.accepted_view = [
+            wp.from_torch(t) for t in (self.selected, self.improved, self.accepted)]
 
-    def select(self, candidates, owners, costs, active, errors):
-        selected = torch.empty_like(active)
-        improved = torch.empty(len(active), dtype=torch.bool, device=active.device)
-        ids, winner, flags = wp.from_torch(active), wp.from_torch(selected), wp.from_torch(improved)
+    def select(self, candidates, owners, costs, active, errors, *, sorted_owners=False):
+        """Return transient flags, valid until the next select on this state.
+
+        sorted_owners is a producer guarantee, never inferred by a GPU readback.
+        False handles arbitrary owner order, including legacy fallback solvers.
+        """
+        ids, winner, flags = wp.from_torch(active), self.winner_view, self.improved_view
         wp.launch(_select, dim=(len(active), BLOCK), block_dim=BLOCK,
             inputs=[wp.from_torch(costs), wp.from_torch(owners), wp.from_torch(candidates), ids,
-                    self.models, self.best_score, self.found], outputs=[winner, flags], stream=self.stream)
-        wp.launch(_mask, dim=(len(active), self.capacity), inputs=[wp.from_torch(errors), ids, winner,
-            1, flags, self.threshold, self.valid, self.masks], stream=self.stream)
-        return improved
+                    self.models, self.best_score, self.found, int(sorted_owners), winner, flags,
+                    wp.from_torch(errors), self.valid, self.threshold, self.masks], stream=self.stream)
+        return self.improved[:len(active)]
 
     def local(self, refined, good, costs, pair_ids, survivors, improved, errors):
-        accepted = torch.empty_like(good)
-        ids, flags = wp.from_torch(pair_ids), wp.from_torch(accepted)
-        wp.launch(_local, dim=len(pair_ids), inputs=[wp.from_torch(costs), wp.from_torch(good),
+        ids, flags = wp.from_torch(pair_ids), self.accepted_view
+        wp.launch(_local, dim=(len(pair_ids), BLOCK), block_dim=BLOCK,
+            inputs=[wp.from_torch(costs), wp.from_torch(good),
             wp.from_torch(refined), ids, wp.from_torch(survivors), self.models, self.best_score,
-            wp.from_torch(improved)], outputs=[flags], stream=self.stream)
-        wp.launch(_mask, dim=(len(pair_ids), self.capacity), inputs=[wp.from_torch(errors), ids, ids,
-            0, flags, self.threshold, self.valid, self.masks], stream=self.stream)
+            wp.from_torch(improved), flags, wp.from_torch(errors), self.valid, self.threshold,
+            self.masks], stream=self.stream)
 
     def update_budget(self, active, sample_size):
         wp.launch(_budget, dim=(len(active), BLOCK), block_dim=BLOCK,

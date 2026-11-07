@@ -48,7 +48,7 @@ class ColmapCache(Cache):
             return ''
         if kind == 'keypoints':
             return str(int(key))
-        if kind in ('correspondences', 'two_view'):
+        if kind in ('correspondences', 'two_view', 'two_view_uncalibrated'):
             return '_'.join(map(str, sorted(map(int, key))))
         raise ValueError(f'Unknown cache kind: {kind}')
 
@@ -65,7 +65,7 @@ class ColmapCache(Cache):
         image_id1 = image_id2 = None
         if kind == 'keypoints':
             image_id1 = int(key) + 1
-        elif kind in ('correspondences', 'two_view'):
+        elif kind in ('correspondences', 'two_view', 'two_view_uncalibrated'):
             image_id1, image_id2 = sorted(int(index) + 1 for index in key)
         self.db.connection.execute('''INSERT INTO torch_sfm_cache VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(kind, key) DO UPDATE SET data=excluded.data,
@@ -93,7 +93,7 @@ class ColmapCache(Cache):
                 digest.update(value)
         return digest.hexdigest()
 
-    def prepare(self, frames, intrinsics):
+    def prepare(self, frames, intrinsics, *, preserve_geometry_cache=False, prior_focal_length=False):
         matrices = camera_matrix(intrinsics.detach().cpu().double())
         shared = matrices.ndim == 2
         if not shared and matrices.shape != (len(frames), 3, 3):
@@ -130,7 +130,8 @@ class ColmapCache(Cache):
                 try:
                     old = self.db.read_camera(camera_id)
                 except KeyError:
-                    self.db.add_camera(CameraModel.PINHOLE, width, height, params, camera_id=camera_id)
+                    self.db.add_camera(CameraModel.PINHOLE, width, height, params, camera_id=camera_id,
+                                       prior_focal_length=prior_focal_length)
                 else:
                     if old.model != CameraModel.PINHOLE or (old.width, old.height) != (width, height):
                         raise ValueError('Database camera model or image dimensions do not match the input')
@@ -138,6 +139,9 @@ class ColmapCache(Cache):
                         calibration_changed = True
                         self.db.connection.execute('UPDATE cameras SET params=? WHERE camera_id=?',
                                                    (params.astype('<f8').tobytes(), camera_id))
+                    if old.prior_focal_length != prior_focal_length:
+                        self.db.connection.execute('UPDATE cameras SET prior_focal_length=? WHERE camera_id=?',
+                                                   (int(prior_focal_length), camera_id))
             for image_id, name, camera_id in images:
                 try:
                     old = self.db.read_image(image_id)
@@ -146,7 +150,7 @@ class ColmapCache(Cache):
                 else:
                     if (old.name, old.camera_id) != (name, camera_id):
                         raise ValueError('Database image IDs/names do not match the pipeline; use a different database_path')
-            if calibration_changed:
+            if calibration_changed and not preserve_geometry_cache:
                 self.db.connection.execute('DELETE FROM two_view_geometries')
                 self.db.connection.execute("DELETE FROM torch_sfm_cache WHERE kind='two_view'")
             self._write_extra('metadata', metadata)
@@ -154,6 +158,11 @@ class ColmapCache(Cache):
     def load(self, kind, key=None):
         if not self.path.exists():
             return None
+        if kind == 'two_view_uncalibrated':
+            extra = self._extra(kind, key)
+            if extra is None or extra['direction'] != tuple(map(int, key)):
+                return None
+            return extra['payload']
         if kind == 'retrieval':
             pairs = self._extra(kind)
             return None if pairs is None else pairs.numpy()
@@ -201,10 +210,22 @@ class ColmapCache(Cache):
             self.db.connection.execute(f'DELETE FROM {table} WHERE pair_id / ? = ? OR pair_id % ? = ?',
                                        (MAX_IMAGE_ID, image_id, MAX_IMAGE_ID, image_id))
         self.db.connection.execute("""DELETE FROM torch_sfm_cache
-            WHERE kind IN ('correspondences', 'two_view') AND (image_id1=? OR image_id2=?)""",
+            WHERE kind IN ('correspondences', 'two_view', 'two_view_uncalibrated') AND (image_id1=? OR image_id2=?)""",
             (image_id, image_id))
 
+    def invalidate_two_view(self, keys):
+        with self.db.connection:
+            for key in keys:
+                self.db.connection.execute('DELETE FROM two_view_geometries WHERE pair_id=?',
+                    (image_ids_to_pair_id(*(int(i)+1 for i in key)),))
+                self.db.connection.execute("DELETE FROM torch_sfm_cache WHERE kind='two_view' AND key=?",
+                    (self._key('two_view', key),))
+
     def save(self, kind, data, key=None):
+        if kind == 'two_view_uncalibrated':
+            with self.db.connection:
+                self._write_extra(kind, {'direction': tuple(map(int, key)), 'payload': data}, key)
+            return
         with self.db.connection:
             if kind == 'retrieval':
                 self._write_extra(kind, torch.as_tensor(data, dtype=torch.int32).cpu())
@@ -231,7 +252,7 @@ class ColmapCache(Cache):
                 self._write_extra(kind, {'scores': data['scores'].detach().cpu()}, key)
                 self.db.connection.execute('DELETE FROM two_view_geometries WHERE pair_id=?',
                                            (image_ids_to_pair_id(*ids),))
-                self.db.connection.execute("DELETE FROM torch_sfm_cache WHERE kind='two_view' AND key=?",
+                self.db.connection.execute("DELETE FROM torch_sfm_cache WHERE kind IN ('two_view','two_view_uncalibrated') AND key=?",
                                            (self._key(kind, key),))
             elif kind == 'two_view':
                 geometry = data['geometry']

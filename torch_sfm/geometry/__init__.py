@@ -9,6 +9,9 @@ from .bundle_adjustment import (
     filter_tracks, reprojection_errors, retriangulate_tracks,
 )
 from .triangulation import TriangulationConfig
+from .camera_recovery import CameraRecoveryConfig
+from .pose_refinement import refine_pose
+from .view_graph_calibration import ViewGraphCalibrationConfig, calibrate_view_graph
 
 __all__ = [
     'TwoViewConfig', 'TwoViewGeometry', 'camera_matrix', 'verify_two_view', 'verify_two_view_batch',
@@ -16,5 +19,8 @@ __all__ = [
     'build_tracks', 'rotation_averaging', 'translation_averaging',
     'BundleAdjustmentConfig', 'BundleAdjustmentResult', 'bundle_adjustment',
     'TriangulationConfig',
+    'CameraRecoveryConfig',
+    'refine_pose',
+    'ViewGraphCalibrationConfig', 'calibrate_view_graph',
     'filter_tracks', 'reprojection_errors', 'retriangulate_tracks',
 ]

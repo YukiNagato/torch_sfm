@@ -18,7 +18,7 @@ class FileSystemCache(Cache):
             return self.path / 'retrieval.txt'
         if kind == 'keypoints':
             name = str(int(key))
-        elif kind in ('correspondences', 'two_view'):
+        elif kind in ('correspondences', 'two_view', 'two_view_uncalibrated'):
             name = f'{int(key[0])}_{int(key[1])}'
         else:
             raise ValueError(f'Unknown cache kind: {kind}')
@@ -33,6 +33,11 @@ class FileSystemCache(Cache):
                     else np.empty((0, 2), dtype=np.int32))
         return torch.load(path, map_location='cpu', weights_only=True)
 
+    def invalidate_two_view(self, keys):
+        for key in keys:
+            for pair in (key, key[::-1]):
+                self._path('two_view', pair).unlink(missing_ok=True)
+
     def save(self, kind, data, key=None):
         path = self._path(kind, key)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,10 +49,11 @@ class FileSystemCache(Cache):
             torch.save(data, temporary)
         temporary.replace(path)
         if kind == 'keypoints':
-            for dependent in ('correspondences', 'two_view'):
+            for dependent in ('correspondences', 'two_view', 'two_view_uncalibrated'):
                 for candidate in (self.path / dependent / self.method).glob('*.pt'):
                     if int(key) in tuple(map(int, candidate.stem.split('_'))):
                         candidate.unlink()
         elif kind == 'correspondences':
             for pair in (key, key[::-1]):
                 self._path('two_view', pair).unlink(missing_ok=True)
+                self._path('two_view_uncalibrated', pair).unlink(missing_ok=True)

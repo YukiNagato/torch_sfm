@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from torch_sfm.core import Frame, SFMStorage
 from torch_sfm.utils import Timer
 from torch_sfm.cache import create_cache, copy_cache
@@ -11,6 +11,7 @@ from torch_sfm.geometry import (
     TwoViewConfig, TwoViewGeometry, RotationConfig, PositionConfig,
     camera_matrix, verify_two_view_batch, rotation_averaging, translation_averaging,
     BundleAdjustmentConfig, bundle_adjustment,
+    ViewGraphCalibrationConfig, calibrate_view_graph,
 )
 from PIL import Image
 from typing import List
@@ -18,6 +19,64 @@ from tqdm import tqdm
 
 
 timer = Timer()
+
+
+def _calibration_cache_options(config):
+    if config is None:
+        return None
+    options = dict(config) if isinstance(config, dict) else asdict(config)
+    # Execution choices retain the objective and convergence policy. Excluding
+    # new fields also preserves the fingerprints of existing calibration caches.
+    options.pop('shared_analytic_jacobian', None)
+    options.pop('shared_cpu_max_pairs', None)
+    return options
+
+
+def _geometry_cache_options(config):
+    if config is None:
+        return None
+    options = dict(config) if isinstance(config, dict) else asdict(config)
+    # Execution-only choices preserve the mathematical problem. Existing valid
+    # geometry remains reusable; update_cache_for_two_view forces remeasurement.
+    options.pop('shared_focal_cpu_workers', None)
+    options.pop('shared_focal_refinement_backend', None)
+    options.pop('shared_focal_local_batch_size', None)
+    options.pop('shared_focal_pair_batch_size', None)
+    options.pop('shared_focal_max_padded_matches', None)
+    # The no-recovery solver can drop candidates that the guarded solver keeps.
+    # Give this policy a distinct cache identity, preserving old cache keys.
+    if options.get('shared_focal_root_backend') != 'warp_poselib':
+        options.pop('shared_focal_root_backend', None)
+    if options.get('five_point_backend') != 'warp_poselib':
+        options.pop('five_point_backend', None)
+    if options.get('calibration') == 'uncalibrated':
+        options.pop('essential_cheirality', None)
+    return options
+
+
+def _verification_batches(pending, config):
+    """Bound shared-focal batches by pairs and padded matching storage.
+
+    Adjacent size buckets can share a batch, avoiding separate RANSAC tails.
+    A pair larger than the storage budget is processed alone. Other model
+    families keep their existing bucket grouping and pair limit.
+    """
+    if (config.calibration!='uncalibrated' or config.uncalibrated_model!='shared_focal'
+            or config.shared_focal_pair_batch_size==0):
+        for bucket in pending.values():
+            for start in range(0,len(bucket),config.pair_batch_size):
+                yield bucket[start:start+config.pair_batch_size]
+        return
+    chunk=[];capacity=0
+    for key in sorted(pending):
+        for entry in pending[key]:
+            size=max(8,len(entry[4].indices))
+            if chunk and (len(chunk)>=config.verification_pair_batch_size or
+                          (len(chunk)+1)*max(capacity,size)>config.shared_focal_max_padded_matches):
+                yield chunk
+                chunk=[];capacity=0
+            chunk.append(entry);capacity=max(capacity,size)
+    if chunk:yield chunk
 
 
 def load_frame_image(frame: Frame):
@@ -49,8 +108,13 @@ class GlomapConfig:
     position: PositionConfig = field(default_factory=PositionConfig)
     bundle_adjustment: BundleAdjustmentConfig = field(default_factory=BundleAdjustmentConfig)
     export_colmap: bool = True
+    calibration: ViewGraphCalibrationConfig = field(default_factory=ViewGraphCalibrationConfig)
 
     def __post_init__(self):
+        if isinstance(self.calibration, dict):
+            self.calibration = ViewGraphCalibrationConfig(**self.calibration)
+        if not isinstance(self.calibration, ViewGraphCalibrationConfig):
+            raise TypeError('calibration must be ViewGraphCalibrationConfig or a dictionary')
         if self.cache_backend not in ('filesystem', 'colmap'):
             raise ValueError('cache_backend must be filesystem or colmap')
 
@@ -104,7 +168,11 @@ class GlomapPipeline:
     def _prepare_cache(self, frames, intrinsic=None):
         if self.cfg.use_cache and (intrinsic is not None or not self._cache_prepared):
             if self.cfg.cache_backend == 'colmap':
-                self.cache.prepare(frames, self.get_intrinsics() if intrinsic is None else intrinsic)
+                trusted = self.cfg.calibration.mode == 'trusted' or getattr(self, '_calibration_ready', False)
+                # The pipeline validates exact K, matched pixels and options
+                # per cached pair. Preserve both stages across initial/new K.
+                self.cache.prepare(frames, self.get_intrinsics() if intrinsic is None else intrinsic,
+                                   preserve_geometry_cache=True, prior_focal_length=trusted)
             self._cache_prepared = True
 
     def close(self):
@@ -122,12 +190,32 @@ class GlomapPipeline:
         frames = self.frames or [Frame(frame_idx=i, frame_path=path)
                                  for i, path in enumerate(self.image_list)]
         intrinsic = self.get_intrinsics()
+        trusted = self.cfg.calibration.mode == 'trusted'
+        export_pairs = None if trusted else set()
+        state_path = self.workspace / 'view_graph_calibration.pt'
+        if not trusted and state_path.exists():
+            state = torch.load(state_path, map_location='cpu', weights_only=True)
+            if (state.get('version') == 1 and _calibration_cache_options(state.get('config'))
+                    == _calibration_cache_options(self.cfg.calibration)
+                    and torch.equal(state['input_intrinsics'], intrinsic.cpu())):
+                intrinsic = state['calibrated_intrinsics']
+                trusted = True
+                export_pairs = (set(map(tuple, state['accepted_pairs']))
+                                if state.get('verification_complete')
+                                and _geometry_cache_options(state.get('two_view_config'))
+                                == _geometry_cache_options(self.cfg.two_view) else set())
         with create_cache(backend, self.workspace, self.cfg.correspondence_method, database_path) as target:
             if target.path.resolve() == self.cache.path.resolve():
                 raise ValueError('Source and target caches must be different')
-            self.cache.prepare(frames, intrinsic)
-            target.prepare(frames, intrinsic)
-            return copy_cache(self.cache, target, frames)
+            if self.cfg.cache_backend == 'colmap':
+                self.cache.prepare(frames, intrinsic, preserve_geometry_cache=True, prior_focal_length=trusted)
+            else:
+                self.cache.prepare(frames, intrinsic)
+            if backend == 'colmap':
+                target.prepare(frames, intrinsic, prior_focal_length=trusted)
+            else:
+                target.prepare(frames, intrinsic)
+            return copy_cache(self.cache, target, frames, intrinsics=intrinsic, two_view_pairs=export_pairs)
     
     @timer
     def get_intrinsics(self):
@@ -239,7 +327,9 @@ class GlomapPipeline:
         return correspondences
 
     @timer
-    def get_two_view_geometries(self, frames: List[Frame], correspondences: dict, intrinsic: torch.Tensor):
+    def get_two_view_geometries(self, frames: List[Frame], correspondences: dict, intrinsic: torch.Tensor,
+                                *, config=None, cache_kind='two_view'):
+        config = self.cfg.two_view if config is None else config
         device = torch.device(self.cfg.geometry_device or ('cuda' if torch.cuda.is_available() else 'cpu'))
         matrices = camera_matrix(intrinsic.to(device=device, dtype=torch.float64))
         if matrices.ndim == 2:
@@ -260,7 +350,7 @@ class GlomapPipeline:
         geometries, pending = {}, {}
         refresh = (self.cfg.update_cache_for_two_view or self.cfg.update_cache_for_keypoints
                    or self.cfg.update_cache_for_correspondence)
-        options = asdict(self.cfg.two_view)
+        options = _geometry_cache_options(config)
         for (i, j), matches in tqdm(correspondences.items(), desc='Verify pairs'):
             frame0, frame1 = frames[i], frames[j]
             key = (frame0.frame_idx, frame1.frame_idx)
@@ -273,9 +363,9 @@ class GlomapPipeline:
                 'points1': frame1.keypoints_2d[matches.indices[:, 1].to(frame1.keypoints_2d.device)].cpu(),
             }
             data = None
-            cached = self.cache.load('two_view', key) if self.cfg.use_cache and not refresh else None
+            cached = self.cache.load(cache_kind, key) if self.cfg.use_cache and not refresh else None
             if cached is not None:
-                if (cached.get('version') == 3 and cached['options'] == options
+                if (cached.get('version') == 3 and _geometry_cache_options(cached['options']) == options
                         and cached['sizes'] == (sizes[i], sizes[j])
                         and all(torch.equal(value, cached['inputs'][key]) for key, value in inputs.items())):
                     data = cached['geometry']
@@ -288,25 +378,124 @@ class GlomapPipeline:
             else:
                 capacity = 1 << max(3, (len(matches.indices) - 1).bit_length())
                 pending.setdefault(capacity, []).append((i, j, key, inputs, matches))
-        for bucket in pending.values():
-            for start in tqdm(range(0, len(bucket), self.cfg.two_view.pair_batch_size), desc='Verify batches'):
-                chunk = bucket[start:start + self.cfg.two_view.pair_batch_size]
-                pair0, pair1 = [p[0] for p in chunk], [p[1] for p in chunk]
-                results = verify_two_view_batch(
-                    [frames[i].keypoints_2d.to(device) for i in pair0],
-                    [frames[j].keypoints_2d.to(device) for j in pair1], [p[4] for p in chunk],
-                    matrices[pair0], matrices[pair1], self.cfg.two_view,
-                    [(sizes[i], sizes[j]) for i, j, *_ in chunk])
-                for (i, j, key, inputs, _), geometry in zip(chunk, results):
-                    geometries[i, j] = geometry
-                    if self.cfg.use_cache:
-                        data = {key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
-                                for key, value in vars(geometry).items() if key != 'matches'}
-                        data['indices'] = geometry.matches.indices.cpu()
-                        data['scores'] = geometry.matches.scores.cpu()
-                        self.cache.save('two_view', {'version': 3, 'options': options,
-                            'sizes': (sizes[i], sizes[j]), 'inputs': inputs, 'geometry': data}, key)
+        for chunk in tqdm(_verification_batches(pending, config), desc='Verify batches'):
+            pair0, pair1 = [p[0] for p in chunk], [p[1] for p in chunk]
+            results = verify_two_view_batch(
+                [frames[i].keypoints_2d.to(device) for i in pair0],
+                [frames[j].keypoints_2d.to(device) for j in pair1], [p[4] for p in chunk],
+                matrices[pair0], matrices[pair1], config,
+                [(sizes[i], sizes[j]) for i, j, *_ in chunk])
+            for (i, j, key, inputs, _), geometry in zip(chunk, results):
+                geometries[i, j] = geometry
+                if self.cfg.use_cache:
+                    data = {key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+                            for key, value in vars(geometry).items() if key != 'matches'}
+                    data['indices'] = geometry.matches.indices.cpu()
+                    data['scores'] = geometry.matches.scores.cpu()
+                    self.cache.save(cache_kind, {'version': 3, 'options': options,
+                        'sizes': (sizes[i], sizes[j]), 'inputs': inputs, 'geometry': data}, key)
+        from torch_sfm.geometry.batched_two_view import complete_fundamental_poses
+        complete_fundamental_poses(geometries, frames, intrinsic, config)
         return {pair: geometries[pair] for pair in correspondences}
+
+    @timer
+    def get_calibrated_view_graph(self, frames, correspondences, intrinsic):
+        """Calibrate before any rotation/position averaging; preserve raw matches."""
+        import json
+        cfg = self.cfg.calibration
+        if cfg.mode == 'trusted':
+            self.calibration_stats = {'mode': 'trusted', 'optimized': False}
+            geometries = self.get_two_view_geometries(frames, correspondences, intrinsic,
+                config=replace(self.cfg.two_view, calibration='calibrated'))
+            (self.workspace / 'view_graph_calibration.json').write_text(
+                json.dumps(self.calibration_stats, indent=2) + '\n')
+            return intrinsic, geometries
+        shared_focal = cfg.shared_focal_ransac and camera_matrix(intrinsic).ndim == 2
+        first = self.get_two_view_geometries(frames, correspondences, intrinsic,
+            config=replace(self.cfg.two_view, calibration='uncalibrated', refine_relative_pose=False,
+                uncalibrated_model='shared_focal' if shared_focal else 'fundamental'),
+            cache_kind='two_view_uncalibrated')
+        device = self.cfg.geometry_device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        import hashlib
+        digest = hashlib.sha256(json.dumps(_calibration_cache_options(cfg), sort_keys=True).encode())
+        digest.update(str((len(frames), tuple(intrinsic.shape))).encode())
+        digest.update(intrinsic.detach().cpu().double().numpy().tobytes())
+        ordered = sorted(first)
+        digest.update(json.dumps([(p, first[p].config, first[p].F is not None) for p in ordered]).encode())
+        fundamentals = [first[p].F for p in ordered if first[p].F is not None]
+        if fundamentals:
+            digest.update(torch.stack(fundamentals).detach().cpu().double().numpy().tobytes())
+        fingerprint = digest.hexdigest()
+        state_path = self.workspace / 'view_graph_calibration.pt'
+        refresh = (self.cfg.update_cache_for_two_view or self.cfg.update_cache_for_keypoints
+                   or self.cfg.update_cache_for_correspondence)
+        cached = (torch.load(state_path, map_location='cpu', weights_only=True)
+                  if self.cfg.use_cache and not refresh and state_path.exists() else None)
+        if cached is not None and cached.get('version') == 1 and cached.get('fingerprint') == fingerprint:
+            updated = cached['calibrated_intrinsics'].to(device=device, dtype=intrinsic.dtype)
+            accepted = set(map(tuple, cached['accepted_pairs']))
+            stats = dict(cached['stats'], cache_hit=True)
+        else:
+            calibration_geometry = first
+            if cfg.refine_fundamental and not shared_focal:
+                from torch_sfm.geometry.fundamental_refinement import refine_view_graph_fundamentals
+                calibration_geometry = refine_view_graph_fundamentals(frames,first,device=device,
+                    batch_size=self.cfg.two_view.pair_batch_size, max_iterations=cfg.fundamental_refine_iterations,
+                    intrinsics=intrinsic,model=cfg.fundamental_refine_model,
+                    focal_ratio_bounds=(cfg.min_focal_ratio,cfg.max_focal_ratio))
+            updated, accepted, stats = calibrate_view_graph(calibration_geometry, intrinsic.to(device), len(frames), cfg)
+            stats['cache_hit'] = False
+        self._calibration_ready = True
+        if self.cfg.use_cache:
+            self.cache.invalidate_two_view(set(correspondences)-accepted)
+        def save_calibration(verification_complete=False):
+            # Retain a completed calibration even if later verification is interrupted.
+            self.calibration_stats = stats
+            (self.workspace / 'view_graph_calibration.json').write_text(json.dumps(stats, indent=2) + '\n')
+            temporary = state_path.with_suffix('.pt.tmp')
+            torch.save({'version': 1, 'fingerprint': fingerprint, 'accepted_pairs': sorted(accepted),
+                        'verification_complete': verification_complete,
+                        'two_view_config': asdict(self.cfg.two_view),
+                        'input_intrinsics': intrinsic.cpu(), 'calibrated_intrinsics': updated.cpu(),
+                        'config': asdict(cfg), 'stats': stats}, temporary)
+            temporary.replace(state_path)
+        save_calibration()
+        second_config = replace(self.cfg.two_view, calibration='calibrated',
+            max_error=cfg.relpose_max_error, min_num_inliers=cfg.relpose_min_num_inliers,
+            min_inlier_ratio=cfg.relpose_min_inlier_ratio, refine_relative_pose=True)
+        # COLMAP re-estimates epipolar pairs only. A planar/panoramic H remains
+        # valid in pixel space when the focal changes; decompose it with new K.
+        planar = {pair: replace(first[pair]) for pair in correspondences
+                  if pair in accepted and first[pair].config in ('PLANAR', 'PANORAMIC')}
+        verified = self.get_two_view_geometries(frames,
+            {pair: matches for pair, matches in correspondences.items() if pair in accepted and pair not in planar},
+            updated, config=second_config)
+        stats['reverified_pairs'] = len(verified)
+        from torch_sfm.geometry.batched_two_view import complete_homography_poses
+        complete_homography_poses(planar, frames, updated, second_config)
+        stats['retained_homography_pairs'] = len(planar)
+        # Publish the final geometry for cache conversion with its actual K
+        # and distinct provenance, so it cannot masquerade as 1px E/F RANSAC.
+        if self.cfg.use_cache:
+            matrices = camera_matrix(updated).detach().cpu()
+            if matrices.ndim == 2:
+                matrices = matrices.expand(len(frames), -1, -1)
+            for (i, j), geometry in planar.items():
+                key = (frames[i].frame_idx, frames[j].frame_idx)
+                source = self.cache.load('two_view_uncalibrated', key)
+                if source is None:
+                    continue
+                data = {name: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+                        for name, value in vars(geometry).items() if name != 'matches'}
+                data.update(indices=geometry.matches.indices.cpu(), scores=geometry.matches.scores.cpu())
+                inputs = dict(source['inputs'], intrinsics=matrices[[i, j]])
+                self.cache.save('two_view', dict(source, geometry=data, inputs=inputs,
+                    options=dict(source['options'], pose_source='retained_homography')), key)
+        verified.update(planar)
+        verified = {pair: verified[pair] for pair in correspondences if pair in verified}
+        stats['relative_pose_pairs'] = sum(g.R is not None for g in verified.values())
+        save_calibration(verification_complete=True)
+        return updated, verified
 
     @timer
     def get_rotations(self, geometries: dict):
@@ -342,6 +531,7 @@ class GlomapPipeline:
 
     @timer
     def run(self):
+        self._calibration_ready = False
         intrinsic = self.get_intrinsics()
         self.load_frames()
         self._prepare_cache(self.frames, intrinsic)
@@ -349,7 +539,8 @@ class GlomapPipeline:
         self.get_keypoints(self.frames)
         correspondences = self.get_correspondences(self.frames, retrieval_pairs)
         self.prepare_verification()
-        geometries = self.get_two_view_geometries(self.frames, correspondences, intrinsic)
+        input_intrinsic = intrinsic.clone()
+        intrinsic, geometries = self.get_calibrated_view_graph(self.frames, correspondences, intrinsic)
         rotations = self.get_rotations(geometries)
         positions = self.get_positions(rotations.edges, rotations.rotations, intrinsic)
         initial = {
@@ -358,6 +549,7 @@ class GlomapPipeline:
             'registered': positions.registered.cpu(), 'rotation_registered': rotations.registered.cpu(),
             'points3d': positions.points3d.cpu(), 'observations': positions.observations.cpu(),
             'intrinsics': intrinsic.cpu(), 'image_paths': [str(frame.frame_path) for frame in self.frames],
+            'input_intrinsics': input_intrinsic.cpu(), 'calibration': self.calibration_stats,
             'positioning_method': positions.method, 'stage': 'global_positioning',
             'solver_summaries': [asdict(s) for s in rotations.summaries + positions.summaries],
         }
@@ -380,6 +572,7 @@ class GlomapPipeline:
             'observations': self.result.observations.cpu(),
             'intrinsics': self.result.intrinsics.cpu(),
             'initial_intrinsics': intrinsic.cpu(),
+            'input_intrinsics': input_intrinsic.cpu(), 'calibration': self.calibration_stats,
             'image_paths': [str(frame.frame_path) for frame in self.frames],
             'positioning_method': self.result.positioning_method,
             'solver_summaries': [asdict(summary) for summary in self.result.solver_summaries],

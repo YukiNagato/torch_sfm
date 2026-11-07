@@ -1,6 +1,6 @@
 """Robust rotation averaging and GLOMAP-style bearing global positioning.
 
-All numerical work uses PyTorch and torchls. Python dictionaries and union-find
+Numerical work uses PyTorch/torchls with optional Warp PCG on CUDA. Dictionaries and union-find
 only handle view-graph and feature-track connectivity.
 """
 
@@ -38,12 +38,32 @@ class RotationConfig:
     loss_scale: float = 5.0  # degrees, Geman-McClure
     max_error: float = 10.0  # degrees, post-solve edge filtering
     convergence: float = 1e-3  # radians, average update
+    pcg_backend: str = 'auto'  # Warp for CUDA float32/64 when installed; Torch otherwise
+    method: str = 'auto'  # fixed-system L1/IRLS below the dense size limit; otherwise LM
+    linear_max_cameras: int = 2048
+    linear_filter_passes: int = 2
+    ridge_regularization: float = 1e-9
+    admm_initial_iterations: int = 10
+    admm_max_iterations: int = 100
+    admm_absolute_tolerance: float = 1e-4
+    admm_relative_tolerance: float = 1e-2
 
     def __post_init__(self):
         if min(self.l1_iterations, self.irls_iterations) < 0 or self.inner_iterations < 1:
             raise ValueError('Invalid rotation iteration limits')
         if not 0 < self.loss_scale < 180 or not 0 < self.max_error <= 180 or self.convergence <= 0:
             raise ValueError('Invalid rotation angular thresholds')
+        if self.pcg_backend not in ('auto', 'torch', 'warp'):
+            raise ValueError('PCG backend must be auto, torch or warp')
+        if self.method not in ('auto', 'lm', 'l1_irls'):
+            raise ValueError('Rotation method must be auto, lm or l1_irls')
+        if self.linear_max_cameras < 2 or self.linear_filter_passes < 1:
+            raise ValueError('Invalid fixed-system size/filtering limits')
+        if not 1 <= self.admm_initial_iterations <= self.admm_max_iterations:
+            raise ValueError('Invalid ADMM iteration limits')
+        if not all(math.isfinite(x) and x >= 0 for x in (
+                self.ridge_regularization, self.admm_absolute_tolerance, self.admm_relative_tolerance)):
+            raise ValueError('Invalid ADMM tolerances or ridge')
 
 
 @dataclass
@@ -53,11 +73,18 @@ class PositionConfig:
     min_views_per_track: int = 3
     scale_parameterization: str = 'bounded'  # Euclidean scales with solver-side lower bounds
     scale_initialization: str = 'unit'  # 'geometry' retains the previous initialization
-    pairwise_linear_solver: str = 'auto'  # dense Schur for small camera systems
+    pairwise_linear_solver: str = 'conjugate_gradient'
+    joint_linear_solver: str = 'conjugate_gradient'
+    jacobian_batch_size: int | None = None
+    normal_blocks_backend: str = 'auto'
+    normal_matvec: str = 'auto'  # full PCG: Warp when PCG backend is Warp
+    cache_retained_matrix: bool = False
     pcg_rtol: float = 1e-3
     pairwise_max_iterations: int = 20  # warm start when tracks permit joint refinement
+    track_backend: str = 'auto'  # colmap policy: Warp on CUDA when installed, CPU otherwise
     track_strategy: str = 'conflict_aware'  # or 'colmap': union first, reject inconsistent tracks
     track_intra_image_consistency_threshold: float = 10.0  # pixels, used by 'colmap'
+    pcg_backend: str = 'auto'  # Warp on supported CUDA when installed; Torch otherwise
 
     def __post_init__(self):
         if self.max_iterations < 1 or self.loss_scale <= 0 or self.min_views_per_track < 2:
@@ -66,17 +93,33 @@ class PositionConfig:
             raise ValueError('Position scales must use bounded or log parameterization')
         if self.scale_initialization not in ('unit', 'geometry'):
             raise ValueError('Position scale initialization must be unit or geometry')
-        if self.pairwise_linear_solver not in ('auto', 'schur_dense', 'schur_cg'):
+        if self.joint_linear_solver not in ('schur_cg', 'conjugate_gradient'):
+            raise ValueError('Unknown joint positioning solver')
+        if (self.jacobian_batch_size is not None and
+                (isinstance(self.jacobian_batch_size, bool) or
+                 not isinstance(self.jacobian_batch_size, int) or self.jacobian_batch_size < 1)):
+            raise ValueError('Jacobian batch size must be a positive integer or None')
+        if self.normal_blocks_backend not in ('auto', 'torch', 'warp'):
+            raise ValueError('Unknown normal blocks backend')
+        if self.normal_matvec not in ('auto', 'torch', 'warp'):
+            raise ValueError('Unknown normal matvec backend')
+        if self.pairwise_linear_solver not in ('auto', 'schur_dense', 'schur_cg', 'conjugate_gradient'):
             raise ValueError('Unknown pairwise positioning solver')
         if not math.isfinite(self.pcg_rtol) or not 0 < self.pcg_rtol < 1:
             raise ValueError('Position PCG tolerance must lie between zero and one')
         if self.pairwise_max_iterations < 1:
             raise ValueError('Pairwise initialization budget must be positive')
+        if self.track_backend not in ('auto', 'cpu', 'warp'):
+            raise ValueError('Track backend must be auto, cpu or warp')
+        if self.track_backend == 'warp' and self.track_strategy != 'colmap':
+            raise ValueError('Warp tracks require the colmap strategy')
         if self.track_strategy not in ('conflict_aware', 'colmap'):
             raise ValueError('Unknown positioning track strategy')
         if (not math.isfinite(self.track_intra_image_consistency_threshold)
                 or self.track_intra_image_consistency_threshold < 0):
             raise ValueError('Track consistency threshold must be finite and nonnegative')
+        if self.pcg_backend not in ('auto', 'torch', 'warp'):
+            raise ValueError('PCG backend must be auto, torch or warp')
 
 
 @dataclass
@@ -180,23 +223,47 @@ def _rotation_prior(rotation):
     return so3_log(rotation)
 
 
-def _solve_options(max_iterations):
+def _pcg_backend(backend, reference):
+    if backend not in ('auto', 'torch', 'warp'):
+        raise ValueError('PCG backend must be auto, torch or warp')
+    supported = (reference is not None and reference.device.type == 'cuda'
+                 and reference.dtype in (torch.float32, torch.float64))
+    if backend == 'warp' and not supported:
+        raise ValueError('Warp PCG requires CUDA float32 or float64 tensors')
+    if backend == 'auto':
+        from importlib.util import find_spec
+        return 'warp' if supported and find_spec('warp') is not None else 'torch'
+    return backend
+
+
+def _solve_options(max_iterations, *, pcg_backend='torch', reference=None):
     return dict(
         termination=tls.TerminationConfig(max_iterations=max_iterations, gradient_tolerance=1e-9),
-        conjugate_gradient=tls.ConjugateGradientConfig(rtol=1e-8, max_iterations=300),
+        conjugate_gradient=tls.ConjugateGradientConfig(
+            rtol=1e-8, max_iterations=300, backend=_pcg_backend(pcg_backend, reference)),
         trust_region=tls.TrustRegionConfig(lambda_initial=1e-4, strategy='adaptive', damping_mode='diagonal'),
-        jacobi_scaling=True, return_summary=True,
+        # Change only PCG execution. Keep the existing Torch normal operator and
+        # block assembly for a controlled comparison; Warp kernels are optional
+        # follow-up optimizations independent of the PCG backend.
+        normal_blocks_backend='torch', jacobi_scaling=True, return_summary=True,
     )
 
 
-def _position_options(cfg, num_cameras, *, pairwise=False, initializer=False):
+def _position_options(cfg, num_cameras, *, pairwise=False, initializer=False, reference=None):
     iterations = min(cfg.max_iterations, cfg.pairwise_max_iterations) if initializer else cfg.max_iterations
-    options = _solve_options(iterations)
-    options['conjugate_gradient'] = replace(options['conjugate_gradient'], rtol=cfg.pcg_rtol)
-    solver = cfg.pairwise_linear_solver if pairwise else 'schur_cg'
+    options = _solve_options(iterations, pcg_backend=cfg.pcg_backend, reference=reference)
+    solver = cfg.pairwise_linear_solver if pairwise else cfg.joint_linear_solver
     if solver == 'auto':
         solver = 'schur_dense' if 3*num_cameras <= 512 else 'schur_cg'
-    options.update(linear_solver=solver, eliminate='scales')
+    options.update(linear_solver=solver, normal_blocks_backend=cfg.normal_blocks_backend)
+    cg = options['conjugate_gradient']
+    matvec = 'torch'
+    if solver == 'conjugate_gradient':
+        matvec = ('warp' if cg.backend == 'warp' else 'torch') if cfg.normal_matvec == 'auto' else cfg.normal_matvec
+    else:
+        options['eliminate'] = 'scales'
+    options['conjugate_gradient'] = replace(cg, rtol=cfg.pcg_rtol, normal_matvec=matvec,
+        cache_retained_matrix=cfg.cache_retained_matrix and solver == 'schur_cg')
     if cfg.scale_parameterization == 'bounded':
         options['bounds'] = {'scales': (1e-5, None)}
     return options
@@ -210,6 +277,16 @@ def _check_solution(summary, stage):
 @torch.inference_mode(False)
 def rotation_averaging(num_frames, geometries, cfg=None):
     cfg = RotationConfig() if cfg is None else cfg
+    if cfg.method != 'lm':
+        edges = {pair: g for pair, g in geometries.items() if g.R is not None}
+        count = len(largest_component(num_frames, edges))
+        if cfg.method == 'l1_irls' or count <= cfg.linear_max_cameras:
+            from .rotation_averaging_linear import rotation_averaging_linear
+            return rotation_averaging_linear(num_frames, geometries, cfg)
+    return _rotation_averaging_lm(num_frames, geometries, cfg)
+
+
+def _rotation_averaging_lm(num_frames, geometries, cfg):
     edges = {pair: geometry for pair, geometry in geometries.items() if geometry.R is not None}
     if not edges:
         raise ValueError('No geometrically verified rotation edges')
@@ -242,7 +319,8 @@ def rotation_averaging(num_frames, geometries, cfg=None):
             problem.add_residual(_rotation_residual, ('rotations', pairs[:, 0]),
                                  ('rotations', pairs[:, 1]), relative, weights[:, None])
             problem.add_residual(_rotation_prior, ('rotations', 0))
-            solved, summary = problem.solve(**_solve_options(cfg.inner_iterations))
+            solved, summary = problem.solve(**_solve_options(
+                cfg.inner_iterations, pcg_backend=cfg.pcg_backend, reference=reference))
             _check_solution(summary, 'Rotation averaging')
             summaries.append(summary)
             updated = solved['rotations']
@@ -274,7 +352,7 @@ def rotation_averaging(num_frames, geometries, cfg=None):
 
 
 def build_tracks(geometries, active_frames, min_views=3, *, strategy='conflict_aware',
-                 frames=None, intra_image_threshold=10.0):
+                 frames=None, intra_image_threshold=10.0, backend='auto'):
     """Build positioning tracks from the caller's rotation-filtered image pairs.
 
     conflict_aware rejects unions with multiple features from the same image.
@@ -282,10 +360,31 @@ def build_tracks(geometries, active_frames, min_views=3, *, strategy='conflict_a
     features in one image are farther apart than intra_image_threshold pixels,
     and requires min_views distinct images. Nearby same-image features remain.
     The colmap strategy requires frames for the keypoint coordinates.
+    backend='auto' selects Warp for CUDA colmap inputs when installed; otherwise
+    the CPU reference is used. Warp returns CUDA indices, CPU returns CPU indices.
+    Both return identical canonical track IDs and row order. Explicit Warp is
+    supported only for the colmap policy. No runtime failures are hidden.
     """
+    if backend not in ('auto', 'cpu', 'warp'):
+        raise ValueError('Track backend must be auto, cpu or warp')
     if strategy == 'colmap':
+        if frames is None:
+            raise ValueError('colmap track strategy requires frames with keypoints')
+        if min_views < 2 or not math.isfinite(intra_image_threshold) or intra_image_threshold < 0:
+            raise ValueError('Invalid track view count or consistency threshold')
+        if backend != 'cpu' and frames:
+            from importlib.util import find_spec
+            supported = frames[0].keypoints_2d.is_cuda
+            if backend == 'warp' and not supported:
+                raise ValueError('Warp track construction requires CUDA keypoints')
+            if backend == 'warp' or (supported and find_spec('warp') is not None):
+                from .warp_tracks import build_colmap_tracks
+                return build_colmap_tracks(geometries, active_frames, frames, min_views,
+                                           intra_image_threshold)
         return _build_colmap_tracks(geometries, active_frames, frames, min_views,
                                     intra_image_threshold)
+    if backend == 'warp':
+        raise ValueError('Warp tracks require the colmap strategy')
     if strategy != 'conflict_aware':
         raise ValueError('Unknown positioning track strategy')
     active = set(active_frames)
@@ -470,7 +569,8 @@ def translation_averaging(frames, geometries, rotations, intrinsics, cfg=None):
     observations = build_tracks(
         geometries, nodes, cfg.min_views_per_track, strategy=cfg.track_strategy,
         frames=frames,
-        intra_image_threshold=cfg.track_intra_image_consistency_threshold).to(device)
+        intra_image_threshold=cfg.track_intra_image_consistency_threshold,
+        backend=cfg.track_backend).to(device)
     centers, pairs, directions = _initial_centers(nodes, usable, rotations)
     supports = [len(geometry.matches.indices) for geometry in usable.values()]
     strongest = max(range(len(supports)), key=supports.__getitem__)
@@ -485,7 +585,7 @@ def translation_averaging(frames, geometries, rotations, intrinsics, cfg=None):
                          loss=tls.HuberLoss(delta=cfg.loss_scale))
     _add_gauge(problem, anchor)
     solution, summary = problem.solve(**_position_options(
-        cfg, len(nodes), pairwise=True, initializer=len(observations) > 0))
+        cfg, len(nodes), pairwise=True, initializer=len(observations) > 0, reference=rotations))
     _check_solution(summary, 'Pairwise positioning')
     summaries = [summary]
     centers, _ = _normalize_gauge(solution['centers'], centers[:0], anchor)
@@ -539,9 +639,9 @@ def translation_averaging(frames, geometries, rotations, intrinsics, cfg=None):
                           manifolds=manifolds)
     problem.add_residual(_direction_residual, ('centers', camera_ids), ('points', point_ids),
                          ('scales', torch.arange(len(rays), device=device)), rays,
-                         loss=tls.HuberLoss(delta=cfg.loss_scale), batch_size=4096)
+                         loss=tls.HuberLoss(delta=cfg.loss_scale), batch_size=cfg.jacobian_batch_size)
     _add_gauge(problem, anchor)
-    solution, summary = problem.solve(**_position_options(cfg, len(nodes)))
+    solution, summary = problem.solve(**_position_options(cfg, len(nodes), reference=rotations))
     _check_solution(summary, 'Track positioning')
     summaries.append(summary)
     centers, points = _normalize_gauge(solution['centers'], solution['points'], anchor)

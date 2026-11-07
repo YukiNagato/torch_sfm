@@ -41,7 +41,9 @@ class SpeculativeTriangulator(IncrementalTriangulator):
         super().load(points, observations)
         self._reset_evidence()
 
-    def update_geometry(self, rotations, centers, intrinsics):
+    def update_geometry(self, rotations, centers, intrinsics, *, registered=None):
+        if registered is not None:
+            self.active = set(torch.where(registered)[0].tolist())
         self._reset_evidence()
         self.device, self.dtype = centers.device, centers.dtype
         self.rotations = rotations.detach().cpu().double()
@@ -271,10 +273,11 @@ class SpeculativeTriangulator(IncrementalTriangulator):
                 break
         return count
 
-    def triangulate(self):
+    def triangulate(self, frame_indices=None):
         added = 0
+        images = self.valid_cameras if frame_indices is None else self.valid_cameras.intersection(frame_indices)
         order = [
-            n for i in sorted(self.valid_cameras) for n in self.by_image.get(i, [])
+            n for i in sorted(images) for n in self.by_image.get(i, [])
         ]
         size = self.config.batch_lookahead
         for start in range(0, len(order), size):

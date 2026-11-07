@@ -109,7 +109,10 @@ class TensorTriangulator:
         ] = edges[:, 1]
         return neighbors
 
-    def update_geometry(self, rotations, centers, intrinsics):
+    def update_geometry(self, rotations, centers, intrinsics, *, registered=None):
+        """Refresh geometry and optionally camera registration, reusing topology."""
+        if registered is not None:
+            self.registered = registered
         s = self.storage
         if centers.device != s.xy.device:
             raise ValueError(
@@ -257,7 +260,7 @@ class TensorTriangulator:
         best_count, best_error = counts[rows, best], squared[rows, best]
         return xyz, inside, best_count, best_error
 
-    def _estimate(self, nodes):
+    def _estimate(self, nodes, *, lengths=None):
         backend = self.config.tensor_create_backend
         if backend != "torch" and self.storage.xy.is_cuda:
             from importlib.util import find_spec
@@ -265,7 +268,13 @@ class TensorTriangulator:
             if backend == "warp" or find_spec("warp") is not None:
                 from .warp_triangulation_create import estimate
 
-                return estimate(self, nodes)
+                return estimate(
+                    self,
+                    nodes,
+                    lengths=lengths,
+                    mixed=lengths is not None
+                    and self.config.tensor_create_bucketing == "none",
+                )
         elif backend == "warp":
             raise ValueError("Warp track creation requires CUDA storage")
         return self._estimate_torch(nodes)
@@ -374,9 +383,46 @@ class TensorTriangulator:
             valid &= ~((count == 2) & self.pure_two_view[first])
         groups, count = groups[valid], count[valid]
         added = 0
-        # Bucket by size to avoid padding every job to the largest graph degree.
-        for width in torch.unique(count).cpu().tolist():
-            selected = groups[count == width, -width:]
+        widths = torch.unique(count).cpu().tolist()
+        ranged = self.config.tensor_create_bucketing != "exact" and s.xy.is_cuda
+        if ranged:
+            from importlib.util import find_spec
+
+            backend = self.config.tensor_create_backend
+            ranged = backend == "warp" or (
+                backend == "auto" and find_spec("warp") is not None
+            )
+        buckets = [(w - 1, w) for w in widths]
+        unbucketed = ranged and self.config.tensor_create_bucketing == "none"
+        if ranged and widths:
+            threshold = self.config.exhaustive_max_track_length
+            bounds = sorted({min(4, threshold), min(8, threshold), threshold})
+            upper = max(32, 1 << threshold.bit_length())
+            while upper < widths[-1]:
+                bounds.append(upper)
+                upper *= 2
+            bounds.append(upper)
+            buckets = []
+            lower = 1
+            for upper in bounds:
+                present = [w for w in widths if lower < w <= upper]
+                if present:
+                    buckets.append((lower, max(present)))
+                lower = upper
+            if unbucketed:
+                buckets = [(1, widths[-1])]
+            # Keep shorter tracks ahead of longer ones, as in exact buckets.
+            order = torch.argsort(count, stable=True)
+            groups, count = groups[order], count[order]
+        for lower, width in buckets:
+            if unbucketed:
+                selected, lengths = groups[:, -width:], count
+            else:
+                selection = (
+                    ((count > lower) & (count <= width)) if ranged else count == width
+                )
+                selected = groups[selection, -width:]
+                lengths = count[selection] if ranged else None
             hypotheses = min(width * (width - 1) // 2, self.config.max_num_trials)
             if width > self.config.exhaustive_max_track_length:
                 hypotheses = min(hypotheses, self.config.tensor_hypothesis_batch)
@@ -388,11 +434,22 @@ class TensorTriangulator:
                     self.config.batch_max_observations // work,
                 ),
             )
+            if unbucketed:
+                # One candidate batch per Create call; bucket work caps do not apply.
+                batch = len(selected)
             for start in range(0, len(selected), batch):
                 nodes = selected[start : start + batch]
                 # A previous batch may have claimed observations in this one.
-                nodes = torch.where(s.point_id[nodes] == -1, nodes, -1)
-                xyz, inliers = self._estimate(nodes)
+                if lengths is None:
+                    nodes = torch.where(s.point_id[nodes] == -1, nodes, -1)
+                    xyz, inliers = self._estimate(nodes)
+                else:
+                    nodes = torch.where(
+                        (nodes >= 0) & (s.point_id[nodes.clamp_min(0)] == -1), nodes, -1
+                    )
+                    xyz, inliers = self._estimate(
+                        nodes, lengths=lengths[start : start + batch]
+                    )
                 rows, cols = torch.where(inliers)
                 winner = torch.full_like(s.point_id, len(nodes))
                 winner.scatter_reduce_(
@@ -434,11 +491,15 @@ class TensorTriangulator:
         s.assign(ids, selected[accepted])
         return len(ids)
 
-    def triangulate(self):
+    def triangulate(self, frame_indices=None):
         """Process each image once; Create bounds its geometry work internally."""
         s = self.storage
         added = 0
-        for image in torch.where(self.valid_cameras)[0].cpu().tolist():
+        images = torch.where(self.valid_cameras)[0].cpu().tolist()
+        if frame_indices is not None:
+            requested = set(frame_indices)
+            images = [image for image in images if image in requested]
+        for image in images:
             lo, hi = s.frame_offsets[image : image + 2]
             ids = torch.arange(lo, hi, device=s.xy.device)
             ids = ids[(self.degree[ids] > 0) & s.obs_valid[ids]]

@@ -24,7 +24,7 @@ class TwoViewConfig:
     max_trials: int = 10000
     batch_size: int = 240  # hypotheses per pair; measured on RTX 4090 D (issues/009)
     pair_batch_size: int = 64
-    backend: str = 'auto'  # Warp scoring and five-point real roots on CUDA, otherwise Torch
+    backend: str = 'auto'  # Warp CUDA geometry kernels, otherwise Torch
     pose_cuda_graph: bool = False  # opt in for repeatedly reused shapes; capture has startup cost
     min_num_inliers: int = 15
     min_inlier_ratio: float = 0.0
@@ -36,8 +36,47 @@ class TwoViewConfig:
     watermark_min_inlier_ratio: float = 0.7
     watermark_border_size: float = 0.1
     seed: int = 0
+    calibration: str = 'calibrated'  # uncalibrated estimates F/H without using K
+    uncalibrated_model: str = 'fundamental'  # or shared_focal: six-point RANSAC
+    shared_focal_cuda_graph: bool = True
+    essential_cheirality: bool = True  # reject behind-camera points during E hypothesis scoring
+    shared_focal_cpu_workers: int = 0  # 0: up to 8 allocated CPUs; 1: serial LAPACK batch
+    shared_focal_refinement_backend: str = 'auto'  # fused Warp LM on CUDA float64, Torch otherwise
+    shared_focal_local_batch_size: int = 512  # selected LO hypotheses per refinement chunk
+    shared_focal_pair_batch_size: int = 256  # 0 uses pair_batch_size; independent of trials per pair
+    shared_focal_max_padded_matches: int = 524288  # pipeline batching memory bound, pairs * max matches
+    shared_focal_root_backend: str = 'auto'  # auto/warp: guarded QR + LAPACK; warp_poselib: full Warp solver, no fallback
+    five_point_backend: str = 'auto'  # warp_poselib: full Warp minimal solver + all-five cheirality
+
+    @property
+    def verification_pair_batch_size(self):
+        if self.calibration=='uncalibrated' and self.uncalibrated_model=='shared_focal':
+            return self.shared_focal_pair_batch_size or self.pair_batch_size
+        return self.pair_batch_size
 
     def __post_init__(self):
+        if self.five_point_backend not in ('auto','warp_poselib'):
+            raise ValueError('five_point_backend must be auto or warp_poselib')
+        if self.five_point_backend == 'warp_poselib' and self.backend == 'torch':
+            raise ValueError('warp_poselib cannot be combined with backend="torch"')
+        if self.shared_focal_root_backend not in ('auto','cpu','warp','warp_poselib'):
+            raise ValueError('shared_focal_root_backend must be auto, cpu, warp or warp_poselib')
+        if self.shared_focal_root_backend == 'warp_poselib' and self.backend == 'torch':
+            raise ValueError('warp_poselib cannot be combined with backend="torch"')
+        if self.calibration not in ('calibrated', 'uncalibrated'):
+            raise ValueError('Two-view calibration must be calibrated or uncalibrated')
+        if self.uncalibrated_model not in ('fundamental','shared_focal'):
+            raise ValueError('Unknown uncalibrated epipolar model')
+        if not isinstance(self.shared_focal_cpu_workers,int) or self.shared_focal_cpu_workers<0:
+            raise ValueError('shared_focal_cpu_workers must be a nonnegative integer')
+        if self.shared_focal_refinement_backend not in ('auto','torch','warp','warp_fused'):
+            raise ValueError('shared_focal_refinement_backend must be auto, torch, warp or warp_fused')
+        if type(self.shared_focal_local_batch_size) is not int or self.shared_focal_local_batch_size<1:
+            raise ValueError('shared_focal_local_batch_size must be a positive integer')
+        if not isinstance(self.shared_focal_pair_batch_size,int) or self.shared_focal_pair_batch_size<0:
+            raise ValueError('shared_focal_pair_batch_size must be a nonnegative integer')
+        if not isinstance(self.shared_focal_max_padded_matches,int) or self.shared_focal_max_padded_matches<1:
+            raise ValueError('shared_focal_max_padded_matches must be a positive integer')
         if self.max_error <= 0 or not math.isfinite(self.max_error):
             raise ValueError('max_error must be finite and positive')
         if not 0 < self.confidence < 1 or not 0 < self.min_trials <= self.max_trials:
@@ -120,8 +159,15 @@ _CUBIC_INDICES = [_MONOMIALS.index(tuple(sum(v[d] for v in terms) for d in range
                   for terms in product(_LINEAR, repeat=3)]
 
 
-def essential_five_point(points0, points1, return_owners=False, backend='torch'):
+def essential_five_point(points0, points1, return_owners=False, backend='torch', *, solver_backend='auto'):
     """Batched minimal solver; return all finite, real essential matrices."""
+    if solver_backend == 'warp_poselib':
+        if backend == 'torch':
+            raise ValueError('warp_poselib cannot be combined with backend="torch"')
+        from .warp_five_point_poselib import essential_five_point as solve
+        return solve(points0,points1,return_owners=return_owners)
+    if solver_backend != 'auto':
+        raise ValueError('solver_backend must be auto or warp_poselib')
     design = _epipolar_design(points0, points1)
     _, singular, vh = torch.linalg.svd(design, full_matrices=True)
     basis = vh[:, -4:].transpose(-1, -2).reshape(-1, 3, 3, 4)
@@ -206,21 +252,33 @@ def _cubic_real_roots(coefficients):
     return roots, valid & torch.isfinite(roots)
 
 
-def fundamental_seven_point(points0, points1, return_owners=False):
+def _seven_point_coefficients(basis):
+    a0, a1, a2 = basis[:, 0].unbind(-2)
+    b0, b1, b2 = basis[:, 1].unbind(-2)
+    cross_aa, cross_bb = torch.linalg.cross(a1, a2), torch.linalg.cross(b1, b2)
+    cross_ab = torch.linalg.cross(a1, b2) + torch.linalg.cross(b1, a2)
+    return torch.stack(((a0 * cross_aa).sum(-1),
+        (b0 * cross_aa + a0 * cross_ab).sum(-1),
+        (a0 * cross_bb + b0 * cross_ab).sum(-1), (b0 * cross_bb).sum(-1)), -1)
+
+
+def fundamental_seven_point(points0, points1, return_owners=False, backend='torch'):
+    if points0.is_cuda and points0.dtype == torch.float64 and points0.shape[-2] == 7 and backend != 'torch':
+        try:
+            from .warp_seven_point import fundamental_seven_point as fused_seven_point
+        except ImportError:
+            if backend == 'warp':
+                raise
+        else:
+            return fused_seven_point(points0, points1, return_owners)
     normalized0, transform0 = normalize_points(points0)
     normalized1, transform1 = normalize_points(points1)
     design = _epipolar_design(normalized0, normalized1)
     _, singular, vh = torch.linalg.svd(design, full_matrices=design.shape[-2] < 9)
     basis = vh[:, -2:].reshape(-1, 2, 3, 3)
-    a0, a1, a2 = basis[:, 0].unbind(-2)
-    b0, b1, b2 = basis[:, 1].unbind(-2)
-    cross_aa, cross_bb = torch.linalg.cross(a1, a2), torch.linalg.cross(b1, b2)
-    cross_ab = torch.linalg.cross(a1, b2) + torch.linalg.cross(b1, a2)
-    coefficients = torch.stack(((a0 * cross_aa).sum(-1),
-        (b0 * cross_aa + a0 * cross_ab).sum(-1),
-        (a0 * cross_bb + b0 * cross_ab).sum(-1), (b0 * cross_bb).sum(-1)), -1)
-    valid = ((coefficients[:, 3].abs() > 1e-12)
-             & (singular[:, -1] > 1e-10 * singular[:, 0]))
+    rank = singular[:, -1] > 1e-10 * singular[:, 0]
+    coefficients = _seven_point_coefficients(basis)
+    valid = (coefficients[:, 3].abs() > 1e-12) & rank
     coefficients, basis = coefficients[valid], basis[valid]
     owners = torch.arange(len(points0), device=points0.device)[valid]
     if len(basis) == 0:
@@ -247,7 +305,15 @@ def epipolar_eight_point(points0, points1, essential=False):
     return matrix[singular[..., -2] > 1e-10 * singular[..., 0]]
 
 
-def homography_dlt(points0, points1, return_owners=False):
+def homography_dlt(points0, points1, return_owners=False, backend='torch'):
+    if points0.is_cuda and points0.dtype == torch.float64 and points0.shape[-2] == 4 and backend != 'torch':
+        try:
+            from .warp_homography import homography_dlt as fused_homography
+        except ImportError:
+            if backend == 'warp':
+                raise
+        else:
+            return fused_homography(points0, points1, return_owners)
     normalized0, transform0 = normalize_points(points0)
     normalized1, transform1 = normalize_points(points1)
     xy1 = homogeneous(normalized0)
@@ -256,8 +322,9 @@ def homography_dlt(points0, points1, return_owners=False):
     row1 = torch.cat((zero, -xy1, normalized1[..., 1:] * xy1), -1)
     design = torch.stack((row0, row1), -2).flatten(-3, -2)
     _, singular, vh = torch.linalg.svd(design, full_matrices=design.shape[-2] < 9)
-    matrix = torch.linalg.solve(transform1, vh[..., -1, :].reshape(-1, 3, 3) @ transform0)
+    vector = vh[..., -1, :]
     rank = singular[..., 7] > 1e-10 * singular[..., 0]
+    matrix = torch.linalg.solve(transform1, vector.reshape(-1, 3, 3) @ transform0)
     valid = rank & (torch.linalg.det(matrix).abs() > 1e-12)
     return (matrix[valid], torch.arange(len(points0), device=points0.device)[valid]) if return_owners else matrix[valid]
 
@@ -426,10 +493,14 @@ def verify_two_view(keypoints0, keypoints1, matches, intrinsics0, intrinsics1,
     """Verify a calibrated pinhole pair, retaining model classification on failure.
 
     Numeric inputs must share a float64/float32 device. Returned match indices
-    index the original keypoint arrays. Unsupported calibration is classified
-    UNCALIBRATED rather than silently producing a pose with incorrect K.
+    index the original keypoint arrays. F-supported pairs remain UNCALIBRATED;
+    in calibrated mode their pose is recovered from F and the supplied K.
     """
     cfg = TwoViewConfig() if cfg is None else cfg
+    if cfg.calibration == 'uncalibrated':
+        from .batched_two_view import verify_two_view_batch
+        return verify_two_view_batch([keypoints0], [keypoints1], [matches],
+            intrinsics0, intrinsics1, cfg, None if image_sizes is None else [image_sizes])[0]
     device = keypoints0.device
     dtype = torch.float64
     keypoints0 = keypoints0.detach().to(dtype=dtype).clone()
@@ -450,9 +521,20 @@ def verify_two_view(keypoints0, keypoints1, matches, intrinsics0, intrinsics1,
     normalized0, normalized1 = rays0[:, :2] / rays0[:, 2:], rays1[:, :2] / rays1[:, 2:]
     inverse0, inverse1 = torch.linalg.inv(matrix0), torch.linalg.inv(matrix1)
     generator = torch.Generator(device=device).manual_seed(cfg.seed)
-    essential, mask_e = _ransac(normalized0, normalized1, essential_five_point,
+    def essential_error(models):
+        if cfg.essential_cheirality:
+            from .essential_scoring import essential_errors
+            return essential_errors(models, torch.zeros(len(models), device=device, dtype=torch.long),
+                points0[None], points1[None], inverse0[None], inverse1[None],
+                torch.ones((1,len(points0)),device=device,dtype=torch.bool),cfg.backend)
+        return sampson_error(inverse1.T @ models @ inverse0, points0, points1)
+    essential_estimator = essential_five_point
+    if cfg.five_point_backend != 'auto':
+        def essential_estimator(a,b):
+            return essential_five_point(a,b,backend=cfg.backend,solver_backend=cfg.five_point_backend)
+    essential, mask_e = _ransac(normalized0, normalized1, essential_estimator,
         lambda a, b: epipolar_eight_point(a, b, essential=True),
-        lambda models: sampson_error(inverse1.T @ models @ inverse0, points0, points1), 5, cfg, generator)
+        essential_error, 5, cfg, generator)
     fundamental, mask_f = _ransac(points0, points1, fundamental_seven_point, epipolar_eight_point,
         lambda models: sampson_error(models, points0, points1), 7, cfg, generator)
     homography, mask_h = _ransac(points0, points1, homography_dlt, homography_dlt,
@@ -467,8 +549,8 @@ def verify_two_view(keypoints0, keypoints1, matches, intrinsics0, intrinsics1,
                 matrix0, matrix1, cfg.pose_cuda_graph, cfg.backend)
             from torchls.geometry import skew
             candidate = skew(t) @ r
-            old_error = sampson_error((inverse1.T @ essential @ inverse0)[None], points0, points1)[0]
-            new_error = sampson_error((inverse1.T @ candidate @ inverse0)[None], points0, points1)[0]
+            old_error = essential_error(essential[None])[0]
+            new_error = essential_error(candidate[None])[0]
             if new_error.clamp_max(cfg.max_error ** 2).sum() < old_error.clamp_max(cfg.max_error ** 2).sum():
                 essential = candidate
                 mask_e = new_error <= cfg.max_error ** 2
@@ -498,7 +580,7 @@ def verify_two_view(keypoints0, keypoints1, matches, intrinsics0, intrinsics1,
         result.config = 'WATERMARK'
         return result
     if result.config == 'UNCALIBRATED':
-        return result
+        essential = matrix1.T @ fundamental @ matrix0
     poses = (homography_poses(homography, matrix0, matrix1) if result.config == 'PLANAR'
              else essential_poses(essential))
     rotation, translation, positive, angle = _choose_pose(poses, rays0[mask], rays1[mask])

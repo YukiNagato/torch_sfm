@@ -1,6 +1,7 @@
 """GlobalMapper's staged BA and incremental-refinement policy in Python."""
 
 import math
+import time
 from dataclasses import asdict
 
 import torch
@@ -17,6 +18,7 @@ from .bundle_adjustment import (
     reprojection_errors,
 )
 from .triangulation import IncrementalTriangulator
+from .camera_recovery import recover_cameras
 
 
 def normalize_reconstruction(centers, points, registered):
@@ -118,6 +120,7 @@ def global_bundle_adjustment(
     )
     intrinsics = intrinsics.detach().to(rotations).clone()
     registered = registered.detach().clone()
+    initially_registered = registered.clone()
     if rotations.shape != (len(frames), 3, 3) or centers.shape != (len(frames), 3):
         raise ValueError("BA expects one rotation and center per frame")
     _pinhole_parameters(intrinsics)
@@ -131,6 +134,7 @@ def global_bundle_adjustment(
         "stages": [],
         "filters": [],
         "refinements": [],
+        "camera_recovery": [],
     }
     summaries = []
     if not cfg.enabled or not len(observations):
@@ -281,6 +285,33 @@ def global_bundle_adjustment(
         }
         if not len(observations):
             raise RuntimeError("No tracks remain after GLOMAP retriangulation")
+        pending_recovery = None
+
+        def integrate_recovered(stage, *, shared_completion):
+            nonlocal pending_recovery
+            if pending_recovery is None:
+                return 0
+            if points.is_cuda:
+                torch.cuda.synchronize(points.device)
+            start = time.perf_counter()
+            if not shared_completion:
+                triangulator.load(points, observations)
+                triangulator.update_geometry(
+                    rotations, centers, intrinsics, registered=registered)
+            added = triangulator.triangulate(frame_indices=pending_recovery["recovered"])
+            if not shared_completion:
+                pending_recovery["completion"] = triangulator.complete_and_merge()
+            if points.is_cuda:
+                torch.cuda.synchronize(points.device)
+            elapsed = time.perf_counter() - start
+            pending_recovery.update(
+                triangulated=added, integration_stage=stage,
+                integration_seconds=elapsed, completion_shared=shared_completion,
+                triangulator_reused=True,
+                seconds=pending_recovery["pnp_seconds"] + elapsed)
+            pending_recovery = None
+            return added
+
         for i in range(cfg.retriangulation_max_refinements):
             # IncrementalMapper removes negative depth before each global BA.
             filter_stage(f"refine_{i + 1}_depth", math.inf, "pixel")
@@ -288,7 +319,11 @@ def global_bundle_adjustment(
             solve_stage(f"refine_{i + 1}_joint", cfg.retriangulation_max_iterations)
             normalize()
             triangulator.load(points, observations)
-            triangulator.update_geometry(rotations, centers, intrinsics)
+            triangulator.update_geometry(
+                rotations, centers, intrinsics, registered=registered)
+            # PnP inliers entered the BA above. Triangulate the recovered views
+            # with their refined poses and share this round's completion/merge.
+            recovery_added = integrate_recovered(f"refine_{i + 1}", shared_completion=True)
             changed = triangulator.complete_and_merge()
             points, observations = triangulator.export()
             removed = filter_stage(
@@ -297,7 +332,7 @@ def global_bundle_adjustment(
                 "pixel",
                 cfg.refinement_min_tri_angle,
             )
-            ratio = (changed["completed"] + changed["merged"] + removed) / max(
+            ratio = (changed["completed"] + changed["merged"] + removed + recovery_added) / max(
                 old_obs, 1
             )
             stats["refinements"].append(
@@ -305,11 +340,34 @@ def global_bundle_adjustment(
                     "iteration": i + 1,
                     **changed,
                     "filtered": removed,
+                    "recovery_triangulated": recovery_added,
                     "change_ratio": ratio,
                 }
             )
-            if ratio < cfg.retriangulation_min_change:
+            recovered = []
+            if (cfg.camera_recovery.enabled and i < cfg.camera_recovery.max_rounds
+                    and not bool(registered.all())):
+                if points.is_cuda:
+                    torch.cuda.synchronize(points.device)
+                start = time.perf_counter()
+                observations, recovery = recover_cameras(
+                    frames, geometries, rotations, centers, points, observations,
+                    intrinsics, registered, cfg.camera_recovery)
+                recovered = recovery["recovered"]
+                if points.is_cuda:
+                    torch.cuda.synchronize(points.device)
+                elapsed = time.perf_counter() - start
+                recovery.update(after_refinement=i + 1, pnp_seconds=elapsed, seconds=elapsed)
+                stats["camera_recovery"].append(recovery)
+                if recovered:
+                    pending_recovery = recovery
+            if ratio < cfg.retriangulation_min_change and not recovered:
                 break
+        if pending_recovery is not None:
+            # A recovery at the iteration cap has no later refinement round.
+            # Complete its tracks before the existing final joint BA instead.
+            integrate_recovered("retriangulation_final", shared_completion=False)
+            points, observations = triangulator.export()
         filter_stage(
             "retriangulation_final_before_ba", cfg.max_normalized_reprojection_error
         )
@@ -321,6 +379,24 @@ def global_bundle_adjustment(
             angle=cfg.min_tri_angle,
         )
 
+    # Acceptance must survive the final filtering, not just the initial PnP fit.
+    newly_registered = registered & ~initially_registered
+    if bool(newly_registered.any()):
+        recovered_obs = observations[newly_registered[observations[:, 1]]]
+        recovered_error, recovered_positive = reprojection_errors(
+            frames, rotations, centers, points, recovered_obs, intrinsics)
+        supported = recovered_positive & (recovered_error <= cfg.camera_recovery.max_reprojection_error)
+        counts = torch.bincount(recovered_obs[supported, 1], minlength=len(frames))
+        stats["camera_recovery_final_support"] = {
+            str(image): int(counts[image]) for image in torch.where(newly_registered)[0].cpu().tolist()
+        }
+        unsupported = newly_registered & (counts < cfg.camera_recovery.min_inliers)
+        stats["camera_recovery_final_rejected"] = torch.where(unsupported)[0].cpu().tolist()
+        if bool(unsupported.any()):
+            registered[unsupported] = False
+            centers[unsupported] = torch.nan
+            points, observations = _compact(points, observations, ~unsupported[observations[:, 1]], 2)
+        stats["recovered_cameras"] = torch.where(registered & ~initially_registered)[0].cpu().tolist()
     errors, positive = reprojection_errors(
         frames, rotations, centers, points, observations, intrinsics
     )

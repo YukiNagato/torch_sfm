@@ -107,6 +107,50 @@ class Frame(FrameIndexedData):
         return cls(**kwargs)
 
 
+@dataclass(frozen=True)
+class ObservationIndex:
+    """Packed keypoint coordinates/IDs shared by positioning and triangulation.
+
+    Every input keypoint has a slot, including unmatched observations.
+    """
+    xy: torch.Tensor
+    frame_id: torch.Tensor
+    feature_id: torch.Tensor
+    frame_offsets: tuple[int, ...]
+
+    @classmethod
+    def from_frames(cls, frames, *, device=None, dtype=None):
+        reference = frames[0].keypoints_2d if frames else torch.empty(0, 2)
+        device = device or reference.device
+        dtype = dtype or reference.dtype
+        if not torch.empty((), dtype=dtype).is_floating_point():
+            raise ValueError("Reconstruction coordinates must be floating point")
+        counts = [len(f.keypoints_2d) for f in frames]
+        offsets = [0]
+        for count in counts:
+            offsets.append(offsets[-1] + count)
+        n = offsets[-1]
+        xy = (
+            torch.cat(
+                [f.keypoints_2d.detach().to(device=device, dtype=dtype) for f in frames]
+            )
+            if frames
+            else torch.empty(0, 2, device=device, dtype=dtype)
+        )
+        if xy.shape != (n, 2):
+            raise ValueError("Expected keypoint coordinates of shape (count, 2)")
+
+        ids = torch.arange(n, device=device)
+        frame_id = torch.repeat_interleave(
+            torch.arange(len(counts), device=device),
+            torch.tensor(counts, device=device, dtype=torch.long),
+            output_size=n,
+        )
+        starts = torch.tensor(offsets[:-1], device=device, dtype=torch.long)
+        feature_id = ids - starts[frame_id]
+        return cls(xy, frame_id, feature_id, tuple(offsets))
+
+
 @dataclass
 class ReconstructionStorage:
     """Fixed N-slot observation, point and work arrays on one device.
@@ -144,25 +188,10 @@ class ReconstructionStorage:
 
     @classmethod
     def from_frames(cls, frames, *, device=None, dtype=None):
-        reference = frames[0].keypoints_2d if frames else torch.empty(0, 2)
-        device = device or reference.device
-        dtype = dtype or reference.dtype
-        if not torch.empty((), dtype=dtype).is_floating_point():
-            raise ValueError("Reconstruction coordinates must be floating point")
-        counts = [len(f.keypoints_2d) for f in frames]
-        offsets = [0]
-        for count in counts:
-            offsets.append(offsets[-1] + count)
-        n = offsets[-1]
-        xy = (
-            torch.cat(
-                [f.keypoints_2d.detach().to(device=device, dtype=dtype) for f in frames]
-            )
-            if frames
-            else torch.empty(0, 2, device=device, dtype=dtype)
-        )
-        if xy.shape != (n, 2):
-            raise ValueError("Expected keypoint coordinates of shape (count, 2)")
+        index = ObservationIndex.from_frames(frames, device=device, dtype=dtype)
+        xy, frame_id, feature_id = index.xy, index.frame_id, index.feature_id
+        offsets = index.frame_offsets
+        n, device, dtype = len(xy), xy.device, xy.dtype
 
         def integer(value=0):
             return torch.full((n,), value, dtype=torch.long, device=device)
@@ -176,13 +205,6 @@ class ReconstructionStorage:
             )
 
         ids = torch.arange(n, device=device)
-        frame_id = torch.repeat_interleave(
-            torch.arange(len(counts), device=device),
-            torch.tensor(counts, device=device, dtype=torch.long),
-            output_size=n,
-        )
-        starts = torch.tensor(offsets[:-1], device=device, dtype=torch.long)
-        feature_id = ids - starts[frame_id]
         return cls(
             xy,
             frame_id,

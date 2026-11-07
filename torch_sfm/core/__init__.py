@@ -1,3 +1,3 @@
-from .storage import Frame, ReconstructionStorage, SFMStorage
+from .storage import Frame, ObservationIndex, ReconstructionStorage, SFMStorage
 
-__all__ = ["Frame", "ReconstructionStorage", "SFMStorage"]
+__all__ = ["Frame", "ObservationIndex", "ReconstructionStorage", "SFMStorage"]

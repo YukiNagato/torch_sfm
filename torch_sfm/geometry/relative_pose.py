@@ -1,8 +1,8 @@
 """Fixed-size, five-DOF relative-pose LM with an analytic Sampson Jacobian.
 
 Rotation uses right SO(3) updates, translation uses a two-dimensional tangent
-plane on S2. CUDA float64 can fuse residuals, normal equations and updates with
-Warp; the 5x5 solve and the full reference path remain in Torch.
+plane on S2. CUDA float64 runs the whole LM loop, including the 5x5 solve,
+inside one Warp kernel. The full reference path remains in Torch.
 """
 
 from collections import OrderedDict
@@ -64,7 +64,7 @@ def _refine_relative_pose(rotations, translations, pixels0, pixels1, matrices0, 
         valid = torch.ones(pixels0.shape[:2], device=pixels0.device, dtype=torch.bool)
     if rotations.is_cuda and rotations.dtype == torch.float64 and backend != 'torch':
         try:
-            from .warp_relative_pose import refine
+            from .warp_relative_pose_lm import refine
         except ImportError:
             if backend == 'warp':
                 raise

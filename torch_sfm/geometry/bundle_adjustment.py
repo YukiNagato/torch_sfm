@@ -11,6 +11,7 @@ import torchls as tls
 from .averaging import _check_solution, build_tracks, largest_component
 from .two_view import camera_matrix, homogeneous
 from .triangulation import TriangulationConfig
+from .camera_recovery import CameraRecoveryConfig
 
 
 @dataclass
@@ -56,6 +57,7 @@ class BundleAdjustmentConfig:
     retriangulation_min_change: float = .0005
     refinement_max_reprojection_error: float = 4.0
     refinement_min_tri_angle: float = 1.5
+    camera_recovery: CameraRecoveryConfig = field(default_factory=CameraRecoveryConfig)
 
     @classmethod
     def legacy(cls, **overrides):
@@ -68,6 +70,10 @@ class BundleAdjustmentConfig:
         return cls(**values)
 
     def __post_init__(self):
+        if isinstance(self.camera_recovery, dict):
+            self.camera_recovery = CameraRecoveryConfig(**self.camera_recovery)
+        if not isinstance(self.camera_recovery, CameraRecoveryConfig):
+            raise TypeError('camera_recovery must be a CameraRecoveryConfig')
         if self.optimizer_backend not in ('torchls', 'bae'):
             raise ValueError('optimizer_backend must be torchls or bae')
         if self.strategy not in ('glomap', 'legacy'):
