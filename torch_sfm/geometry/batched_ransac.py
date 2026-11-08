@@ -204,6 +204,20 @@ def _shared_focal_local_candidates(candidates, focals, owners, errors, costs,
 @torch.no_grad()
 def ransac_batch(points0, points1, valid, pixel0, pixel1, inverse0, inverse1, kind, cfg,
                  min_inlier_ratio=None, *, fuse_state=True):
+    if cfg.calibration=='calibrated' and cfg.calibrated_frontend!='legacy' and kind in ('E','F','H'):
+        from ..warp_frontend.calibrated_ransac import CalibratedRansac, enabled
+        if enabled(cfg,points0):
+            result=CalibratedRansac(points0,points1,valid,pixel0,pixel1,inverse0,inverse1,kind,cfg,min_inlier_ratio).run()
+            return result.models,result.masks,result.found
+    if kind=='SF' and cfg.shared_focal_frontend!='legacy':
+        use_warp=(points0.is_cuda and points0.dtype==torch.float64 and cfg.backend!='torch'
+                  and cfg.shared_focal_root_backend=='warp_poselib'
+                  and cfg.shared_focal_refinement_backend!='torch')
+        if cfg.shared_focal_frontend=='warp' and not use_warp:
+            raise ValueError('Warp shared-focal frontend requires CUDA float64 inputs')
+        if use_warp:
+            from ..warp_frontend.ransac import ransac_batch as solve
+            return solve(points0,points1,valid,inverse0,inverse1,cfg,min_inlier_ratio)
     count, capacity = valid.shape
     models = torch.eye(3, device=points0.device, dtype=points0.dtype).repeat(count, 1, 1)
     masks = torch.zeros_like(valid)

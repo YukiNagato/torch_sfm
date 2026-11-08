@@ -46,7 +46,9 @@ class TwoViewConfig:
     shared_focal_pair_batch_size: int = 256  # 0 uses pair_batch_size; independent of trials per pair
     shared_focal_max_padded_matches: int = 524288  # pipeline batching memory bound, pairs * max matches
     shared_focal_root_backend: str = 'auto'  # auto/warp: guarded QR + LAPACK; warp_poselib: full Warp solver, no fallback
+    shared_focal_frontend: str = 'auto'  # new Warp controller for CUDA warp_poselib; legacy keeps the old controller
     five_point_backend: str = 'auto'  # warp_poselib: full Warp minimal solver + all-five cheirality
+    calibrated_frontend: str = 'auto'  # fixed-slot Warp E/F/H with warp_poselib; legacy keeps the old controller
 
     @property
     def verification_pair_batch_size(self):
@@ -55,6 +57,15 @@ class TwoViewConfig:
         return self.pair_batch_size
 
     def __post_init__(self):
+        if self.calibrated_frontend not in ('auto','legacy','warp'):
+            raise ValueError('calibrated_frontend must be auto, legacy or warp')
+        if self.calibrated_frontend=='warp' and (self.backend=='torch' or not self.essential_cheirality):
+            raise ValueError('Warp calibrated frontend requires Warp kernels and essential cheirality')
+        if self.shared_focal_frontend not in ('auto','legacy','warp'):
+            raise ValueError('shared_focal_frontend must be auto, legacy or warp')
+        if self.shared_focal_frontend=='warp' and (self.backend=='torch' or self.shared_focal_root_backend!='warp_poselib'
+                                                   or self.shared_focal_refinement_backend=='torch'):
+            raise ValueError('Warp frontend requires warp_poselib, a CUDA-capable backend and Warp refinement')
         if self.five_point_backend not in ('auto','warp_poselib'):
             raise ValueError('five_point_backend must be auto or warp_poselib')
         if self.five_point_backend == 'warp_poselib' and self.backend == 'torch':

@@ -133,12 +133,11 @@ def _retract(r: wp.mat33d, t: wp.vec3d, d: Vec5):
     return proposed_r, proposed_t
 
 
-@wp.kernel
-def _refine(rotations: wp.array3d(dtype=wp.float64), translations: wp.array2d(dtype=wp.float64),
+@wp.func
+def refine_pair(i: int, lane: int, rotations: wp.array3d(dtype=wp.float64), translations: wp.array2d(dtype=wp.float64),
             x0: wp.array3d(dtype=wp.float64), x1: wp.array3d(dtype=wp.float64),
             inverse0: wp.array3d(dtype=wp.float64), inverse1: wp.array3d(dtype=wp.float64),
             valid: wp.array2d(dtype=wp.bool), iterations: int):
-    i, lane = wp.tid()
     r = _matrix(rotations, i)
     t = wp.vec3d(translations[i, 0], translations[i, 1], translations[i, 2])
     inv0, inv1t = _matrix(inverse0, i), wp.transpose(_matrix(inverse1, i))
@@ -210,6 +209,15 @@ def _refine(rotations: wp.array3d(dtype=wp.float64), translations: wp.array2d(dt
             translations[i, row] = t[row]
             for col in range(3):
                 rotations[i, row, col] = r[row, col]
+
+
+@wp.kernel
+def _refine(rotations: wp.array3d(dtype=wp.float64), translations: wp.array2d(dtype=wp.float64),
+            x0: wp.array3d(dtype=wp.float64), x1: wp.array3d(dtype=wp.float64),
+            inverse0: wp.array3d(dtype=wp.float64), inverse1: wp.array3d(dtype=wp.float64),
+            valid: wp.array2d(dtype=wp.bool), iterations: int):
+    i, lane = wp.tid()
+    refine_pair(i,lane,rotations,translations,x0,x1,inverse0,inverse1,valid,iterations)
 
 
 def refine(rotations, translations, x0, x1, inverse0, inverse1, valid, iterations):

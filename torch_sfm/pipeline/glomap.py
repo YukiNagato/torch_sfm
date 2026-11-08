@@ -39,16 +39,32 @@ def _geometry_cache_options(config):
     # Execution-only choices preserve the mathematical problem. Existing valid
     # geometry remains reusable; update_cache_for_two_view forces remeasurement.
     options.pop('shared_focal_cpu_workers', None)
-    options.pop('shared_focal_refinement_backend', None)
+    refinement = options.pop('shared_focal_refinement_backend', None)
     options.pop('shared_focal_local_batch_size', None)
     options.pop('shared_focal_pair_batch_size', None)
     options.pop('shared_focal_max_padded_matches', None)
+    calibrated_frontend = options.pop('calibrated_frontend', 'legacy')
+    if (options.get('calibration')=='calibrated' and options.get('backend')!='torch'
+            and options.get('essential_cheirality',True)
+            and (calibrated_frontend=='warp' or (calibrated_frontend=='auto'
+                 and options.get('five_point_backend')=='warp_poselib'))):
+        options['calibrated_frontend']='warp'
     # The no-recovery solver can drop candidates that the guarded solver keeps.
     # Give this policy a distinct cache identity, preserving old cache keys.
     if options.get('shared_focal_root_backend') != 'warp_poselib':
         options.pop('shared_focal_root_backend', None)
     if options.get('five_point_backend') != 'warp_poselib':
         options.pop('five_point_backend', None)
+    # Old dictionaries predate the new controller and mean legacy. Preserve
+    # their identity; distinguish newly computed first-pass SF results.
+    frontend = options.pop('shared_focal_frontend', 'legacy')
+    if (frontend != 'legacy' and options.get('calibration') == 'uncalibrated'
+            and options.get('uncalibrated_model') == 'shared_focal'
+            and options.get('shared_focal_root_backend') == 'warp_poselib'
+            and options.get('backend') != 'torch' and refinement != 'torch'):
+        options['shared_focal_frontend'] = 'warp'
+        # Revision 2 fixes mutable pose-choice aliases in persistent LO.
+        options['shared_focal_frontend_revision'] = 2
     if options.get('calibration') == 'uncalibrated':
         options.pop('essential_cheirality', None)
     return options

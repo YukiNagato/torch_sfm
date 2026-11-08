@@ -149,6 +149,10 @@ def verify_two_view_batch(keypoints0, keypoints1, matches, intrinsics0, intrinsi
     rays0, rays1 = homogeneous(points0) @ inverse0.transpose(-1, -2), homogeneous(points1) @ inverse1.transpose(-1, -2)
     normalized0, normalized1 = rays0[..., :2] / rays0[..., 2:], rays1[..., :2] / rays1[..., 2:]
     unknown = cfg.calibration == 'uncalibrated'
+    warp_frontend=False
+    if not unknown and cfg.calibrated_frontend!='legacy':
+        from ..warp_frontend.calibrated_ransac import enabled
+        warp_frontend=enabled(cfg,points0)
     if unknown:
         essential = torch.eye(3, device=device, dtype=points0.dtype).repeat(batch, 1, 1)
         mask_e, found_e = torch.zeros_like(valid), torch.zeros(batch, device=device, dtype=torch.bool)
@@ -163,7 +167,10 @@ def verify_two_view_batch(keypoints0, keypoints1, matches, intrinsics0, intrinsi
         min_inlier_ratio=cfg.max_H_inlier_ratio * (mask_f.sum(-1) if unknown else torch.minimum(mask_e.sum(-1), mask_f.sum(-1)))
                          / valid.sum(-1).clamp_min(1))
     ids = torch.arange(batch, device=device)
-    if cfg.refine_relative_pose and not unknown:
+    if cfg.refine_relative_pose and warp_frontend:
+        from ..warp_frontend.pose import pre_refine_essential
+        pre_refine_essential(essential,mask_e,found_e,points0,points1,valid,inverse0,inverse1,cfg)
+    if cfg.refine_relative_pose and not unknown and not warp_frontend:
         rotation, translation, positive = _essential_pose_batch(essential, rays0, rays1, mask_e)
         refine_mask = positive & (positive.sum(-1) >= cfg.min_num_inliers)[:, None] & found_e[:, None]
         if bool(refine_mask.any()):
@@ -235,6 +242,11 @@ def verify_two_view_batch(keypoints0, keypoints1, matches, intrinsics0, intrinsi
             rotation, translation, positive, angle = _choose_pose(
                 homography_poses(homography[i], matrix0[i], matrix1[i]), rays0[i, selected_masks[i]], rays1[i, selected_masks[i]])
             _store_pose(result, rotation, translation, positive, angle, minimum, cfg)
+    if warp_frontend and (calibrated or uncalibrated):
+        from ..warp_frontend.pose import finish_poses
+        finish_poses(results,calibrated+uncalibrated,essential,fundamental,points0,points1,
+            rays0,rays1,selected_masks,inverse0,inverse1,matrix0,matrix1,indices,scores,counts,cfg)
+        calibrated,uncalibrated=[],[]
     if calibrated:
         group = torch.tensor(calibrated, device=device)
         masks = selected_masks[group]
