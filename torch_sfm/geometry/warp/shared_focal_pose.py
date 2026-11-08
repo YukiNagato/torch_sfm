@@ -7,7 +7,7 @@ not the all-five test used by the minimal essential solver.
 """
 import torch
 import warp as wp
-from .warp_relative_pose import _matrix
+from .relative_pose import _matrix
 
 wp.set_module_options({'enable_backward': False, 'fast_math': False,
                        'fuse_fp': False, 'max_unroll': 1})

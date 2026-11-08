@@ -4,8 +4,8 @@ import math
 import torch
 import warp as wp
 
-from ..geometry.warp_essential_pose import _decompose_matrix
-from ..geometry.warp_shared_focal_local import _error
+from .essential_pose import _decompose_matrix
+from .shared_focal_local import _error
 from .local_lm import refine
 from .six_point import _sync
 

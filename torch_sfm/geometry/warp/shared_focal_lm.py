@@ -1,7 +1,7 @@
 """One cooperative block per local shared-focal fit, including all LM steps."""
 import torch
 import warp as wp
-from .warp_relative_pose import _matrix,_skew,_tangent
+from .relative_pose import _matrix, _skew, _tangent
 
 wp.init()
 wp.set_module_options({'enable_backward':False,'max_unroll':8,'fast_math':False})

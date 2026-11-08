@@ -6,7 +6,7 @@ All buffers are allocated once; failed samples stay invalid without CPU repair.
 import torch
 import warp as wp
 
-from ..geometry.warp_shared_focal_poselib import _eliminate_cooperative
+from .shared_focal_poselib import _eliminate_cooperative
 from .six_point_layouts import _initialize, _finish, _sample_workspace, OPTIONS
 from .six_point_scalar_polynomial import coefficients
 from .six_point_split import SplitSixPointBatch

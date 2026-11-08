@@ -6,7 +6,7 @@ residual work on the GPU. Damping, bounds and stopping rules match the reference
 """
 import torch
 import warp as wp
-from .warp_relative_pose import _matrix, _coefficient, _skew, _tangent
+from .relative_pose import _matrix, _coefficient, _skew, _tangent
 
 wp.set_module_options({'enable_backward': False})
 Vec6=wp.types.vector(length=6,dtype=wp.float64)
@@ -168,7 +168,7 @@ def _accept(partials: wp.array3d(dtype=wp.float64),cost: wp.array(dtype=wp.float
 
 
 def refine(rotation,translation,focal,initial,points0,points1,valid,principal0,principal1,iterations,bounds):
-    from .fundamental_refinement import _shared_model
+    from ..fundamental_refinement import _shared_model
     rotation,translation,focal=rotation.clone(),translation.clone(),focal.clone()
     n=len(focal);chunks=(points0.shape[1]+BLOCK-1)//BLOCK
     coefficients=focal.new_empty((n,7,3,3));partials=focal.new_empty((n,chunks,28))

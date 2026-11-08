@@ -34,7 +34,7 @@ Generated fixed polynomial expressions follow PoseLib/solvers/relpose_5pt.cc.
 """
 import torch
 import warp as wp
-from .warp_essential_pose import _decompose_matrix
+from .essential_pose import _decompose_matrix
 
 wp.init()
 wp.set_module_options({'enable_backward': False, 'fast_math': False,

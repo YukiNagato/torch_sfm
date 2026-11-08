@@ -7,7 +7,7 @@ class _Graph:
     def __init__(self,args,capacity,points,iterations,bounds,backend):
         from .fundamental_refinement import _refine_shared_focal_lm
         if backend=='warp':
-            from .warp_shared_focal_refinement import refine as implementation
+            from .warp.shared_focal_refinement import refine as implementation
         else:implementation=_refine_shared_focal_lm
         reference=args[2];device=reference.device;dtype=reference.dtype
         eye=torch.eye(3,device=device,dtype=dtype).repeat(capacity,1,1)
@@ -42,7 +42,7 @@ _calls=OrderedDict()
 def run(args,iterations,bounds,backend='torch'):
     from .fundamental_refinement import _refine_shared_focal_lm
     if backend=='warp':
-        from .warp_shared_focal_refinement import refine as implementation
+        from .warp.shared_focal_refinement import refine as implementation
     else:implementation=_refine_shared_focal_lm
     count,points=args[4].shape[:2];reference=args[2]
     capacity=max(64,1<<(count-1).bit_length());points=1<<(points-1).bit_length()

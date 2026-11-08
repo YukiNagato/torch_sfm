@@ -40,3 +40,7 @@ def _schedule(required: wp.array(dtype=wp.int64),costs: wp.array(dtype=wp.float6
         if wp.int64(trial)<required[pair]:
             active[n]=wp.int64(pair);history[n]=costs[pair];n+=1
     count[0]=n
+
+
+@wp.func_native('return log1pf(x);')
+def _log1p32(x: wp.float32) -> wp.float32: ...

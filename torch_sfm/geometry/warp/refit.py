@@ -2,7 +2,7 @@
 import warp as wp
 from .scoring import BLOCK
 from .six_point import _sync
-from ..geometry.warp_refit_finish import _project
+from .refit_finish import _project
 wp.set_module_options({'enable_backward':False,'fast_math':False,'fuse_fp':False,'max_unroll':1})
 
 @wp.func_native('''

@@ -1,11 +1,10 @@
 """Block-local LM loop reused by the new LO controller.
 
-Arithmetic/stopping rules follow geometry.warp_shared_focal_lm._refine;
+Arithmetic/stopping rules follow geometry.warp.shared_focal_lm._refine;
 only observation indirection and the result handoff differ.
 """
 import warp as wp
-from ..geometry.warp_shared_focal_lm import (Vec6, Vec28, Mat6, _coefficients,
-    _terms, _solve, _rotation_update, _tangent, _model, _residual)
+from .shared_focal_lm import Vec6, Vec28, Mat6, _coefficients, _terms, _solve, _rotation_update, _tangent, _model, _residual
 BLOCK=64
 
 @wp.func

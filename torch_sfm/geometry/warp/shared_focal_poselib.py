@@ -627,7 +627,7 @@ def _recover(a: wp.array3d(dtype=wp.float64), b: wp.array3d(dtype=wp.float64),
 
 @lru_cache(maxsize=8)
 def _indices(device):
-    from . import shared_focal_polynomial as p
+    from .. import shared_focal_polynomial as p
     entries = [(c, i % 31, i // 31) for c, i in zip(p.COEFFS0_IND, p.C0_IND)]
     entries += [(c, i % 31, 31+i // 31) for c, i in zip(p.COEFFS1_IND, p.C1_IND)]
     mapping = [[-1]*31 for _ in range(46)]
@@ -669,7 +669,7 @@ def shared_focal_six_point(points0, points1, principal0, principal1, *, return_d
     stream = wp.stream_from_torch(torch.cuda.current_stream(points0.device))
     wp.launch(_nullspace, dim=n, block_dim=32,
               inputs=[wp.from_torch(v) for v in (*values,basis,scales,sample_status)], stream=stream)
-    from .warp_shared_focal_polynomial import coefficients
+    from .shared_focal_polynomial import coefficients
     coeff = coefficients(basis)
     wp.launch(_eliminate_cooperative, dim=(n,32), block_dim=32,
               inputs=[wp.from_torch(v) for v in (coeff,indices,action_rows,action,counts,sample_status)], stream=stream)

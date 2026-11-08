@@ -138,8 +138,8 @@ def _models(vectors: wp.array3d(dtype=wp.float64),
 
 
 def fundamental_seven_point(points0, points1, return_owners=False):
-    from .warp_nullspace import right_nullspace
-    from .two_view import _seven_point_coefficients
+    from .nullspace import right_nullspace
+    from ..two_view import _seven_point_coefficients
 
     n = len(points0)
     if points0.shape != (n,7,2) or points1.shape != points0.shape:

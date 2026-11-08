@@ -4,7 +4,6 @@ Each hypothesis owns a warp. Lanes keep their best seven keys, then cooperate
 to emit the global top k. No dense (pairs, hypotheses, capacity) score tensor.
 The 32-bit hash is a permutation, so eligible point keys have no ties.
 """
-import torch
 import warp as wp
 
 wp.init()
@@ -55,41 +54,3 @@ def _sample(points0: wp.array3d(dtype=wp.float64), points1: wp.array3d(dtype=wp.
                 keys[shift] = keys[shift+1]
                 indices[shift] = indices[shift+1]
             keys[size-1] = wp.int64(-1)
-
-
-class Sampler:
-    """Per-RANSAC immutable views; active pairs must have at least k valid points.
-
-No global mutable cache or cross-stream workspaces. Seeds and trial counters
-match the original hash/topk sampler exactly, including 32-bit wraparound.
-"""
-    def __init__(self, points0, points1, valid, counts, size, seed):
-        if size not in (4,5,6,7):
-            raise ValueError('Expected RANSAC sample size 4..7')
-        if (points0.ndim != 3 or points0.shape[-1] != 2 or points1.shape != points0.shape
-                or valid.shape != points0.shape[:2] or counts.shape != (len(points0),)):
-            raise ValueError('Invalid RANSAC observation shapes')
-        if (not points0.is_cuda or points0.dtype != torch.float64 or points1.dtype != torch.float64
-                or valid.dtype != torch.bool or counts.dtype != torch.int64
-                or any(t.device != points0.device for t in (points1,valid,counts))):
-            raise ValueError('Warp sampling requires CUDA float64 observations and int64 counts')
-        if torch.is_grad_enabled() and (points0.requires_grad or points1.requires_grad):
-            raise ValueError('Warp sampling is forward only')
-        self.references = (points0,points1,valid,counts)
-        self.views = [wp.from_torch(t) for t in self.references]
-        self.size = size
-        self.bias = wp.uint32(((seed % 2**32)*104729+374761393) & 0xffffffff)
-        self.stream = wp.stream_from_torch(torch.cuda.current_stream(points0.device))
-
-    def sample(self, active, trial, batch):
-        if active.ndim != 1 or active.dtype != torch.int64 or active.device != self.references[0].device:
-            raise ValueError('Expected CUDA int64 active pair indices')
-        if trial < 0 or batch < 1:
-            raise ValueError('Expected nonnegative trial and positive hypothesis batch')
-        a = self.references[0].new_empty((len(active)*batch,self.size,2))
-        b = torch.empty_like(a)
-        if len(active):
-            wp.launch(_sample,dim=(len(active),batch,32),block_dim=32,
-                inputs=[*self.views,wp.from_torch(active),wp.int64(trial),self.bias,self.size,batch],
-                outputs=[wp.from_torch(a),wp.from_torch(b)],stream=self.stream)
-        return a,b

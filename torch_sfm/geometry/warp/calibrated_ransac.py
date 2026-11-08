@@ -8,9 +8,9 @@ from .scoring import score, vote, error, BLOCK
 from .refit import refit
 from .six_point import _sync
 from .ransac import RansacResult
-from ..geometry.warp_relative_pose import _matrix
-from ..geometry.warp_ransac import _log1p
-from ..geometry.essential_scoring import prepare_essential_observations
+from .relative_pose import _matrix
+from .schedule import _log1p32 as _log1p
+from ..essential_scoring import prepare_essential_observations
 wp.set_module_options({'enable_backward':False,'fast_math':False,'fuse_fp':False,'max_unroll':1})
 
 @wp.kernel
@@ -141,12 +141,3 @@ class CalibratedRansac:
                 r.models,r.masks,r.costs,r.found,self.sizes,self.limits,r.required,r.trials,self.design,self.fitted,self.good,self.proposal])
             self.rounds.append(dict(trial=trial,active_pairs=n,samples=n*batch));trial+=batch
         return r
-
-
-def enabled(cfg, points):
-    compatible=(points.is_cuda and points.dtype==torch.float64 and cfg.backend!='torch'
-                and cfg.essential_cheirality)
-    if cfg.calibrated_frontend=='warp' and not compatible:
-        raise ValueError('Warp calibrated frontend requires CUDA float64 and essential cheirality')
-    return compatible and (cfg.calibrated_frontend=='warp' or
-        (cfg.calibrated_frontend=='auto' and cfg.five_point_backend=='warp_poselib'))

@@ -36,37 +36,13 @@ def _geometry_cache_options(config):
     if config is None:
         return None
     options = dict(config) if isinstance(config, dict) else asdict(config)
-    # Execution-only choices preserve the mathematical problem. Existing valid
-    # geometry remains reusable; update_cache_for_two_view forces remeasurement.
-    options.pop('shared_focal_cpu_workers', None)
-    refinement = options.pop('shared_focal_refinement_backend', None)
-    options.pop('shared_focal_local_batch_size', None)
-    options.pop('shared_focal_pair_batch_size', None)
-    options.pop('shared_focal_max_padded_matches', None)
-    calibrated_frontend = options.pop('calibrated_frontend', 'legacy')
-    if (options.get('calibration')=='calibrated' and options.get('backend')!='torch'
-            and options.get('essential_cheirality',True)
-            and (calibrated_frontend=='warp' or (calibrated_frontend=='auto'
-                 and options.get('five_point_backend')=='warp_poselib'))):
-        options['calibrated_frontend']='warp'
-    # The no-recovery solver can drop candidates that the guarded solver keeps.
-    # Give this policy a distinct cache identity, preserving old cache keys.
-    if options.get('shared_focal_root_backend') != 'warp_poselib':
-        options.pop('shared_focal_root_backend', None)
-    if options.get('five_point_backend') != 'warp_poselib':
-        options.pop('five_point_backend', None)
-    # Old dictionaries predate the new controller and mean legacy. Preserve
-    # their identity; distinguish newly computed first-pass SF results.
-    frontend = options.pop('shared_focal_frontend', 'legacy')
-    if (frontend != 'legacy' and options.get('calibration') == 'uncalibrated'
-            and options.get('uncalibrated_model') == 'shared_focal'
-            and options.get('shared_focal_root_backend') == 'warp_poselib'
-            and options.get('backend') != 'torch' and refinement != 'torch'):
-        options['shared_focal_frontend'] = 'warp'
-        # Revision 2 fixes mutable pose-choice aliases in persistent LO.
-        options['shared_focal_frontend_revision'] = 2
+    # New controllers have a separate identity. Never reuse a geometry entry
+    # from the removed mixed implementation; features/matches remain reusable.
+    options['verification_revision'] = options.get('verification_revision', 2) if isinstance(config,dict) else 3
+    for key in ('shared_focal_pair_batch_size','shared_focal_max_padded_matches'):
+        options.pop(key,None)
     if options.get('calibration') == 'uncalibrated':
-        options.pop('essential_cheirality', None)
+        options.pop('essential_cheirality',None)
     return options
 
 
@@ -366,6 +342,8 @@ class GlomapPipeline:
         geometries, pending = {}, {}
         refresh = (self.cfg.update_cache_for_two_view or self.cfg.update_cache_for_keypoints
                    or self.cfg.update_cache_for_correspondence)
+        from torch_sfm.geometry.batched_two_view import resolve_backend
+        config = replace(config,backend=resolve_backend(config,device))
         options = _geometry_cache_options(config)
         for (i, j), matches in tqdm(correspondences.items(), desc='Verify pairs'):
             frame0, frame1 = frames[i], frames[j]
@@ -410,7 +388,7 @@ class GlomapPipeline:
                     data['scores'] = geometry.matches.scores.cpu()
                     self.cache.save(cache_kind, {'version': 3, 'options': options,
                         'sizes': (sizes[i], sizes[j]), 'inputs': inputs, 'geometry': data}, key)
-        from torch_sfm.geometry.batched_two_view import complete_fundamental_poses
+        from torch_sfm.geometry.two_view_poses import complete_fundamental_poses
         complete_fundamental_poses(geometries, frames, intrinsic, config)
         return {pair: geometries[pair] for pair in correspondences}
 
@@ -471,7 +449,7 @@ class GlomapPipeline:
             temporary = state_path.with_suffix('.pt.tmp')
             torch.save({'version': 1, 'fingerprint': fingerprint, 'accepted_pairs': sorted(accepted),
                         'verification_complete': verification_complete,
-                        'two_view_config': asdict(self.cfg.two_view),
+                        'two_view_config': _geometry_cache_options(self.cfg.two_view),
                         'input_intrinsics': intrinsic.cpu(), 'calibrated_intrinsics': updated.cpu(),
                         'config': asdict(cfg), 'stats': stats}, temporary)
             temporary.replace(state_path)
@@ -487,7 +465,7 @@ class GlomapPipeline:
             {pair: matches for pair, matches in correspondences.items() if pair in accepted and pair not in planar},
             updated, config=second_config)
         stats['reverified_pairs'] = len(verified)
-        from torch_sfm.geometry.batched_two_view import complete_homography_poses
+        from torch_sfm.geometry.two_view_poses import complete_homography_poses
         complete_homography_poses(planar, frames, updated, second_config)
         stats['retained_homography_pairs'] = len(planar)
         # Publish the final geometry for cache conversion with its actual K

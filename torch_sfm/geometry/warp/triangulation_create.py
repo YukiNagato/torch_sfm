@@ -10,7 +10,7 @@ import math
 import torch
 import warp as wp
 
-from .warp_svd import smallest_right_vector4
+from .svd import smallest_right_vector4
 
 # ruff: noqa: SIM102 -- explicit guards protect indexed accesses in Warp kernels
 

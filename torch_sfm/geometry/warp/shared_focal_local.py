@@ -1,7 +1,7 @@
 """Score an LO fit and commit its state in one cooperative kernel."""
 import torch
 import warp as wp
-from .warp_relative_pose import _matrix
+from .relative_pose import _matrix
 
 wp.set_module_options({'enable_backward':False, 'fast_math':False, 'max_unroll':1})
 BLOCK=128
@@ -9,7 +9,7 @@ BLOCK=128
 
 @wp.func
 def _error(f: wp.mat33d, x: wp.float64, y: wp.float64, u: wp.float64, v: wp.float64):
-    # Same evaluation order and denominator guard as warp_two_view._score.
+    # Pixel Sampson error with the original denominator guard.
     a=f[0,0]*x+f[0,1]*y+f[0,2]
     b=f[1,0]*x+f[1,1]*y+f[1,2]
     c=f[2,0]*x+f[2,1]*y+f[2,2]

@@ -99,7 +99,7 @@ def _finish(vectors: wp.array2d(dtype=wp.float64), rank: wp.array(dtype=wp.bool)
 
 
 def homography_dlt(points0, points1, return_owners=False):
-    from .warp_nullspace import right_null_vector8
+    from .nullspace import right_null_vector8
     n = len(points0)
     if points0.shape != (n,4,2) or points1.shape != points0.shape:
         raise ValueError('Expected matching batches of four 2D points')

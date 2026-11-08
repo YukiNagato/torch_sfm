@@ -4,10 +4,10 @@ import torch
 import warp as wp
 from .scoring import vec, vote, error, BLOCK
 from .six_point import _sync
-from ..geometry.warp_essential_pose import _decompose_matrix
-from ..geometry.warp_relative_pose import _matrix, _skew
-from ..geometry.warp_relative_pose_lm import refine_pair
-from ..geometry.essential_scoring import prepare_essential_observations
+from .essential_pose import _decompose_matrix
+from .relative_pose import _matrix, _skew
+from .relative_pose_lm import refine_pair
+from ..essential_scoring import prepare_essential_observations
 wp.set_module_options({'enable_backward':False,'fast_math':False,'fuse_fp':False,'max_unroll':1})
 
 @wp.func
@@ -169,7 +169,7 @@ def pre_refine_essential(models,masks,found,p0,p1,valid,inv0,inv1,cfg):
 
 
 def finish_poses(results,members,essential,fundamental,p0,p1,rays0,rays1,masks,inv0,inv1,matrix0,matrix1,indices,scores,counts,cfg):
-    from ..correspondence import Matches
+    from ...correspondence import Matches
     group=torch.tensor(members,device=p0.device);a,b=p0[group],p1[group]
     calibrated=torch.tensor([results[i].config=='CALIBRATED' for i in members],device=p0.device)
     inverse0,inverse1=inv0[group],inv1[group]

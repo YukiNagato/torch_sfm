@@ -64,7 +64,7 @@ def _refine_relative_pose(rotations, translations, pixels0, pixels1, matrices0, 
         valid = torch.ones(pixels0.shape[:2], device=pixels0.device, dtype=torch.bool)
     if rotations.is_cuda and rotations.dtype == torch.float64 and backend != 'torch':
         try:
-            from .warp_relative_pose_lm import refine
+            from .warp.relative_pose_lm import refine
         except ImportError:
             if backend == 'warp':
                 raise

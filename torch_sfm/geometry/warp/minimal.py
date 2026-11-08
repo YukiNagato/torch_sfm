@@ -1,11 +1,11 @@
 """Fixed-capacity E/F/H minimal solvers, without packing or numerical retries."""
 import torch
 import warp as wp
-from ..geometry import warp_five_point_poselib as five
-from ..geometry import warp_seven_point as seven
-from ..geometry import warp_homography as homo
-from ..geometry.warp_nullspace import _nullspace
-from ..geometry.warp_ransac_sampling import _sample
+from . import five_point_poselib as five
+from . import seven_point as seven
+from . import homography as homo
+from .nullspace import _nullspace
+from .ransac_sampling import _sample
 
 class MinimalBatch:
     def __init__(self, points0, points1, valid, sizes, active, cfg, kind):

@@ -266,7 +266,7 @@ class TensorTriangulator:
             from importlib.util import find_spec
 
             if backend == "warp" or find_spec("warp") is not None:
-                from .warp_triangulation_create import estimate
+                from .warp.triangulation_create import estimate
 
                 return estimate(
                     self,
@@ -563,7 +563,7 @@ class TensorTriangulator:
             from importlib.util import find_spec
 
             if backend == "warp" or find_spec("warp") is not None:
-                from .warp_triangulation import merge_tracks
+                from .warp.triangulation import merge_tracks
 
                 return merge_tracks(self)
         elif backend == "warp":

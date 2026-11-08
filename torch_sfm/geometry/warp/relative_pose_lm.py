@@ -7,7 +7,7 @@ float64 arithmetic and LM acceptance rules. No runtime reference solve.
 import warp as wp
 import torch
 
-from .warp_relative_pose import _matrix, _skew, _tangent, Vec5
+from .relative_pose import _matrix, _skew, _tangent, Vec5
 
 wp.set_module_options({'enable_backward': False, 'max_unroll': 8, 'fast_math': False})
 Mat5 = wp.types.matrix(shape=(5, 5), dtype=wp.float64)

@@ -81,8 +81,8 @@ def essential_errors_prepared(models, owners, rays0, rays1, jac0, jac1, valid, b
         return models.new_empty((0, valid.shape[1]))
     if models.is_cuda and models.dtype == torch.float64 and backend != 'torch':
         try:
-            from .warp_essential_scoring import score
-            from .warp_essential_pose import decompose
+            from .warp.essential_scoring import score
+            from .warp.essential_pose import decompose
         except ImportError:
             if backend == 'warp':
                 raise

@@ -378,7 +378,7 @@ def build_tracks(geometries, active_frames, min_views=3, *, strategy='conflict_a
             if backend == 'warp' and not supported:
                 raise ValueError('Warp track construction requires CUDA keypoints')
             if backend == 'warp' or (supported and find_spec('warp') is not None):
-                from .warp_tracks import build_colmap_tracks
+                from .warp.tracks import build_colmap_tracks
                 return build_colmap_tracks(geometries, active_frames, frames, min_views,
                                            intra_image_threshold)
         return _build_colmap_tracks(geometries, active_frames, frames, min_views,

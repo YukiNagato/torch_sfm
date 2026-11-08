@@ -1,7 +1,7 @@
 """Shared block scoring: fixed slots, no candidate-by-point error storage."""
 import warp as wp
-from ..geometry.warp_essential_pose import _decompose_matrix
-from ..geometry.warp_relative_pose import _matrix
+from .essential_pose import _decompose_matrix
+from .relative_pose import _matrix
 from .six_point import _sync
 BLOCK=64
 wp.set_module_options({'enable_backward':False,'fast_math':False,'fuse_fp':False,'max_unroll':1})

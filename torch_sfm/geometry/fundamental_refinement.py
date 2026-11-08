@@ -1,9 +1,21 @@
 """Batched rank-two F and shared-focal relative-pose Sampson refinement."""
+import math
 import torch
 from torchls.geometry import skew, so3_exp
 
-from .batched_ransac import _normalize_masked
 from .two_view import homogeneous
+
+
+def _normalize_masked(points, mask):
+    weights = mask.to(points)
+    count = weights.sum(-1).clamp_min(1)
+    center = (points * weights[..., None]).sum(-2) / count[:, None]
+    centered = points - center[:, None]
+    scale = math.sqrt(2) * count / (centered.norm(dim=-1) * weights).sum(-1).clamp_min(1e-12)
+    transform = torch.eye(3, device=points.device, dtype=points.dtype).repeat(len(points), 1, 1)
+    transform[:, 0, 0] = transform[:, 1, 1] = scale
+    transform[:, :2, 2] = -center * scale[:, None]
+    return centered * scale[:, None, None], transform
 
 
 def sampson_matrix_jacobian(matrix, x, y, scale0, scale1, *, jacobian=True):
@@ -115,14 +127,14 @@ def refine_shared_focal(matrix, points0, points1, valid, focal, principal0, prin
     Used within six-point LO-RANSAC and for optional refinement of a seven-point
     F initialization. The camera-sharing constraint holds throughout the fit.
     """
-    from .batched_two_view import _essential_pose_batch
+    from .two_view_poses import _essential_pose_batch
     from .relative_pose import tangent_basis
     pose = _essential_pose_batch
     prepare = None
     if backend in ('auto','warp_fused') and focal.is_cuda and focal.dtype==torch.float64:
         try:
-            from .warp_shared_focal_pose import choose_pose as pose
-            from .warp_shared_focal_prepare import prepare
+            from .warp.shared_focal_pose import choose_pose as pose
+            from .warp.shared_focal_prepare import prepare
         except ImportError:
             if backend=='warp_fused':raise
     if prepare is not None:
@@ -150,9 +162,9 @@ def refine_shared_focal(matrix, points0, points1, valid, focal, principal0, prin
         if focal.is_cuda and focal.dtype==torch.float64:
             try:
                 if backend in ('auto','warp_fused'):
-                    from .warp_shared_focal_lm import refine as implementation
+                    from .warp.shared_focal_lm import refine as implementation
                 else:
-                    from .warp_shared_focal_refinement import refine as implementation
+                    from .warp.shared_focal_refinement import refine as implementation
             except ImportError:
                 if backend in ('warp','warp_fused'):raise
             else:resolved='warp_fused' if backend in ('auto','warp_fused') else 'warp'

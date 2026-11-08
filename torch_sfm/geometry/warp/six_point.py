@@ -12,7 +12,7 @@ import warp as wp
 
 from .six_point_math import _nullspace, _eliminate_cooperative, _action_roots, _recover
 from .six_point_polynomial import coefficients
-from ..geometry.warp_shared_focal_poselib import _indices
+from .shared_focal_poselib import _indices
 
 wp.set_module_options({'enable_backward': False, 'fast_math': False,
                        'fuse_fp': False, 'max_unroll': 1})
