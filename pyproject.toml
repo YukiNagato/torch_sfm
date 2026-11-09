@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch-sfm"
+version = "0.1.0"
+description = "Flexible structure from motion with PyTorch and NVIDIA Warp"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3",
+    "torchvision>=0.18",
+    "torchls @ git+https://github.com/YukiNagato/torchls.git",
+    "warp-lang>=1.17",
+    "numpy>=1.24",
+    "pillow>=10",
+    "tqdm>=4.66",
+    "tyro>=0.9",
+    "plotly>=5.20",
+]
+
+[project.optional-dependencies]
+# SALAD is loaded through torch.hub; these are its runtime dependencies.
+salad = [
+    "pytorch-lightning>=2.0",
+    "pytorch-metric-learning>=2.0",
+    "faiss-cpu>=1.7.4",
+    "einops>=0.7",
+]
+# Revisions used by the frontend experiments.
+loma = [
+    "lomatch @ git+https://github.com/davnords/LoMa.git@415caedde23a9ed479172ed174fe4ff7b4514d4b",
+]
+flexglue = [
+    "raco @ git+https://github.com/cvg/RaCo.git@ee06fa68dbb20303f334fbc257dad71d4149603b",
+    "flexglue @ git+https://github.com/cvg/FlexGlue.git@c6cbc7a933bb70ab58608e8835d99b6cc4adca1a",
+]
+anycalib = [
+    "anycalib @ git+https://github.com/javrtg/AnyCalib.git@027a8497d893f4b2596f23d6324c05e4b81064ed",
+]
+test = ["pytest>=8", "scipy>=1.11"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["torch_sfm", "torch_sfm.*"]
+exclude = ["*.ipynb_checkpoints", "*.ipynb_checkpoints.*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tst"]
+pythonpath = ["."]

@@ -629,22 +629,25 @@ class GlomapPipeline:
         return self.result
 
 
-if __name__ == '__main__':
-    cfg = GlomapConfig(
-        retrieval_top_k=10
-    )
-    data_path = Path('/root/autodl-tmp/data/sfm_data/south-building-1920x1080')
-    pipeline = GlomapPipeline(cfg, data_path)
+def main(workspace: Path, config: GlomapConfig, visualize: bool = True):
+    """Run reconstruction from images.txt and optional intrinsics.txt.
 
-    result = pipeline.run()
-    pipeline.visualize()
-    print(f'{int(result.registered.sum())}/{len(result.registered)} registered images, '
-          f'{len(result.points3d)} points')
+    Args:
+        workspace: Input lists, stage caches and reconstruction output directory.
+        config: Pipeline settings, including frontend, geometry and solver options.
+        visualize: Write the reconstruction HTML visualization after solving.
+    """
+    timer.reset()
+    with GlomapPipeline(config, workspace.expanduser().resolve()) as pipeline:
+        result = pipeline.run()
+        if visualize:
+            pipeline.visualize()
+        print(f'{int(result.registered.sum())}/{len(result.registered)} registered images, '
+              f'{len(result.points3d)} points')
     timer.report()
 
 
+if __name__ == '__main__':
+    import tyro
 
-        
-        
-    
-
+    tyro.cli(main)
