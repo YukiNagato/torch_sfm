@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -10,6 +10,7 @@ from ..core.storage import Frame
 class Matches:
     indices: torch.Tensor  # (M, 2), int64; indices into each frame's keypoints
     scores: torch.Tensor  # (M,)
+    metadata: dict = field(default_factory=dict)
 
 
 class Extractor(ABC):

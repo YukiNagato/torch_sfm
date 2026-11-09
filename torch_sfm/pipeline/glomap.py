@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from pathlib import Path
 from torch_sfm.retrieval import get_retrieval, RetrievalResult
-from torch_sfm.correspondence import get_extractor_and_matcher, Matches
+from torch_sfm.correspondence import get_extractor_and_matcher, Matches, FlexGlueConfig
 from torch_sfm.geometry import (
     TwoViewConfig, TwoViewGeometry, RotationConfig, PositionConfig,
     camera_matrix, verify_two_view_batch, rotation_averaging, translation_averaging,
@@ -83,6 +83,7 @@ def load_frame_image(frame: Frame):
 class GlomapConfig:
     retrieval_method: str = 'salad'
     correspondence_method: str = 'loma'
+    flexglue: FlexGlueConfig = field(default_factory=FlexGlueConfig)
     retrieval_top_k: int = 10
     retrieval_threshold: float = 0.5
 
@@ -103,6 +104,12 @@ class GlomapConfig:
     calibration: ViewGraphCalibrationConfig = field(default_factory=ViewGraphCalibrationConfig)
 
     def __post_init__(self):
+        if isinstance(self.flexglue, dict):
+            self.flexglue = FlexGlueConfig(**self.flexglue)
+        if not isinstance(self.flexglue, FlexGlueConfig):
+            raise TypeError('flexglue must be FlexGlueConfig or a dictionary')
+        if self.correspondence_method == 'flexglue' and self.cache_backend != 'filesystem':
+            raise ValueError('FlexGlue dense feature caches require cache_backend="filesystem"')
         if isinstance(self.calibration, dict):
             self.calibration = ViewGraphCalibrationConfig(**self.calibration)
         if not isinstance(self.calibration, ViewGraphCalibrationConfig):
@@ -143,7 +150,16 @@ class GlomapPipeline:
         self.frames = []
         self.extractor = None
         self.matcher = None
+        self._frontend_options = None
         self.storage = None
+
+    def _prepare_frontend_config(self):
+        """Do not reuse loaded networks after changing frontend settings."""
+        options = (asdict(self.cfg.flexglue)
+                   if self.cfg.correspondence_method == 'flexglue' else None)
+        if options != self._frontend_options:
+            self.extractor = self.matcher = None
+            self._frontend_options = options
 
     @timer
     def prepare_verification(self):
@@ -153,7 +169,7 @@ class GlomapPipeline:
         for index, frame in enumerate(self.frames):
             view = Frame.from_storage(self.storage, index)
             frame.keypoints_2d, frame.image_size = view.keypoints_2d, view.image_size
-            frame.image, frame.features = None, None
+            frame.image, frame.features, frame.dense_features = None, None, None
         self.extractor = self.matcher = None
         return self.storage
 
@@ -259,17 +275,24 @@ class GlomapPipeline:
     def get_keypoints(self, frames: List[Frame]):
         """Fill each frame's keypoints_2d and features, and return the frames."""
         self._prepare_cache(frames)
+        self._prepare_frontend_config()
 
+        feature_options = (self.cfg.flexglue.feature_options()
+                           if self.cfg.correspondence_method == 'flexglue' else None)
         for frame in tqdm(frames, desc='Extract keypoints'):
             data = (self.cache.load('keypoints', frame.frame_idx) if self.cfg.use_cache
                     and not self.cfg.update_cache_for_keypoints else None)
+            if data is not None and feature_options is not None and data.get('options') != feature_options:
+                data = None
             if data is not None:
                 device = frame.image.device if frame.image is not None else 'cpu'
                 frame.keypoints_2d = data['keypoints_2d'].to(device)
-                frame.features = data['features'].to(device)
+                frame.features = data['features'].to(device) if data['features'] is not None else None
+                frame.dense_features = data.get('dense_features')
+                frame.image_size = data.get('image_size', frame.image_size)
             else:
                 if self.extractor is None:
-                    self.extractor, self.matcher = get_extractor_and_matcher(self.cfg.correspondence_method)
+                    self.extractor, self.matcher = get_extractor_and_matcher(self.cfg.correspondence_method, self.cfg.flexglue)
                 image = frame.image
                 frame.image = load_frame_image(frame)
                 self.extractor.extract(frame)
@@ -278,9 +301,14 @@ class GlomapPipeline:
                 if self.cfg.use_cache:
                     self.cache.save('keypoints', {
                         'keypoints_2d': frame.keypoints_2d.cpu(),
-                        'features': frame.features.cpu(),
+                        'features': frame.features.cpu() if frame.features is not None else None,
+                        'dense_features': frame.dense_features,
+                        'image_size': frame.image_size,
+                        'options': feature_options,
                     }, frame.frame_idx)
 
+        if hasattr(self.extractor, 'release'):
+            self.extractor.release()
         return frames
 
     @timer
@@ -288,7 +316,10 @@ class GlomapPipeline:
     def get_correspondences(self, frames: List[Frame], retrieval_pairs: np.ndarray):
         """Return {(i, j): Matches} on CPU; pairs index the supplied frames."""
         self._prepare_cache(frames)
+        self._prepare_frontend_config()
 
+        match_options = (self.cfg.flexglue.matching_options()
+                         if self.cfg.correspondence_method == 'flexglue' else None)
         correspondences = {}
         for i, j in tqdm(retrieval_pairs, desc='Match pairs'):
             i, j = int(i), int(j)
@@ -297,25 +328,38 @@ class GlomapPipeline:
             data = (self.cache.load('correspondences', key) if self.cfg.use_cache
                     and not self.cfg.update_cache_for_correspondence
                     and not self.cfg.update_cache_for_keypoints else None)
+            if data is not None and match_options is not None and data.get('options') != match_options:
+                data = None
             if data is not None:
-                matches = Matches(data['indices'], data['scores'])
+                matches = Matches(data['indices'], data['scores'], data.get('metadata', {}))
             else:
                 if self.matcher is None:
-                    self.extractor, self.matcher = get_extractor_and_matcher(self.cfg.correspondence_method)
+                    self.extractor, self.matcher = get_extractor_and_matcher(self.cfg.correspondence_method, self.cfg.flexglue)
                 image0, image1 = frame0.image, frame1.image
-                frame0.image = load_frame_image(frame0)
-                frame1.image = load_frame_image(frame1)
+                if getattr(self.matcher, 'requires_images', True):
+                    frame0.image = load_frame_image(frame0)
+                    frame1.image = load_frame_image(frame1)
                 matches = self.matcher.match(frame0, frame1)
-                matches = Matches(matches.indices.cpu(), matches.scores.cpu())
+                matches = Matches(matches.indices.cpu(), matches.scores.cpu(), matches.metadata)
                 if not self.cfg.cache_frame_images:
                     frame0.image, frame1.image = image0, image1
                 if self.cfg.use_cache:
                     self.cache.save('correspondences', {
                         'indices': matches.indices,
                         'scores': matches.scores,
+                        'metadata': matches.metadata,
+                        'options': match_options,
                     }, key)
             correspondences[i, j] = matches
 
+        self.matching_stats = {
+            'pairs': len(correspondences),
+            'rejected_pairs': sum(bool(m.metadata.get('rejected')) for m in correspondences.values()),
+            'empty_pairs': sum(len(m.indices) == 0 for m in correspondences.values()),
+            'below_geometry_minimum': sum(len(m.indices) < self.cfg.two_view.min_num_inliers
+                                          for m in correspondences.values()),
+            'matches': sum(len(m.indices) for m in correspondences.values()),
+        }
         return correspondences
 
     @timer
@@ -346,6 +390,11 @@ class GlomapPipeline:
         config = replace(config,backend=resolve_backend(config,device))
         options = _geometry_cache_options(config)
         for (i, j), matches in tqdm(correspondences.items(), desc='Verify pairs'):
+            # Rejected/undersized pairs never enter padding, CUDA transfers or RANSAC.
+            if len(matches.indices) < max(4, config.min_num_inliers):
+                geometries[i, j] = TwoViewGeometry(Matches(
+                    matches.indices[:0].to(device), matches.scores[:0].to(device)))
+                continue
             frame0, frame1 = frames[i], frames[j]
             key = (frame0.frame_idx, frame1.frame_idx)
             # Geometry also depends on calibration, thresholds and matched pixels.

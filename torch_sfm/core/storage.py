@@ -82,6 +82,8 @@ class Frame(FrameIndexedData):
     image_size: tuple[int, int] | None = (
         None  # original (height, width), without retaining pixels
     )
+    # Per-image matcher input, never packed/sliced by keypoint index.
+    dense_features: torch.Tensor | None = None
 
     @classmethod
     def from_storage(cls, storage: SFMStorage, frame_idx: int) -> "Frame":
