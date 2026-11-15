@@ -39,6 +39,12 @@ flexglue = [
 anycalib = [
     "anycalib @ git+https://github.com/javrtg/AnyCalib.git@027a8497d893f4b2596f23d6324c05e4b81064ed",
 ]
+# Camera priors (Solv3R requires Python 3.11 or 3.12).
+solv3r = [
+    "solv3r @ git+https://github.com/ubc-vision/solv3r.git@ef8da34f3736d6c241b3ba3cd074073c06e90b8f",
+]
+# Optional real-track refinement; model code is loaded from a GlueMap checkout.
+vggsfm = ["einops>=0.7", "kornia==0.8.2", "scipy>=1.11"]
 test = ["pytest>=8", "scipy>=1.11"]
 
 [tool.setuptools]

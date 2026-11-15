@@ -35,25 +35,70 @@ select{background:#17263a;color:#dce8f7;border:1px solid #344960;border-radius:5
 <div class="controls">
 <label><input type="checkbox" id="points" checked>Points</label>
 <label><input type="checkbox" id="cameras" checked>Cameras</label>
+<label>Camera display <select id="camera-mode"><option value="frustums">Frustums</option><option value="trajectory">Trajectory only</option></select></label>
 <label><input type="checkbox" id="trajectory">Image-order links</label>
 <label><input type="checkbox" id="axes">Camera XYZ axes</label>
+<label>Camera size <input type="range" id="camera-size" min="0.05" max="3" step="0.05" value="1"><output id="camera-size-value">1.00×</output></label>
 <label>Point size <input type="range" id="point-size" min="1" max="7" step="0.5" value="2"></label>
 <label title="Camera up follows image orientations; it is not measured gravity.">Up <select id="view-up">''' + up_options + '''</select></label>
 <label><input type="checkbox" id="orthographic">Orthographic</label>
 <button data-fit="subject">Subject</button><button data-fit="full">All points</button><button data-fit="cameras">Cameras</button>
 <button id="reset-view">Reset view</button>
-</div><div class="help">Drag to orbit · Scroll to zoom · Right-drag to pan · Equal scale on all axes. Up changes the view only; coordinates stay unchanged.</div></header>
+</div><div class="help">Drag to orbit · Scroll to zoom · Right-drag to pan · Equal scale on all axes. Trajectory links follow image order within each image folder. Up changes the view only; coordinates stay unchanged.</div></header>
 <main id="viewport">''' + plot + '''</main>
 <script>
 const settings = ''' + settings + ''';
 const viewer = document.getElementById('sfm-viewer');
 function updateVisibility(){
-  for(const [name,indices] of Object.entries(settings.groups)){
-    const visible=document.getElementById(name).checked && (name!=='axes'||document.getElementById('cameras').checked);
-    Plotly.restyle(viewer, {visible}, indices);
+  const cameras=document.getElementById('cameras').checked;
+  const trajectoryOnly=document.getElementById('camera-mode').value==='trajectory';
+  const indices=[], visibility=[];
+  for(const [name,group] of Object.entries(settings.groups)){
+    // Set per-trace visibility below so centers stay visible without frustums.
+    for(const index of group){
+      let visible=document.getElementById(name).checked;
+      if(name==='cameras')visible=cameras && (!trajectoryOnly || !viewer.data[index].meta?.camera_geometry);
+      if(name==='trajectory')visible=cameras && (trajectoryOnly || visible);
+      if(name==='axes')visible=cameras && !trajectoryOnly && visible;
+      indices.push(index);
+      visibility.push(visible);
+    }
   }
+  document.getElementById('axes').disabled=!cameras || trajectoryOnly;
+  document.getElementById('trajectory').disabled=!cameras || trajectoryOnly;
+  document.getElementById('camera-size').disabled=!cameras || trajectoryOnly;
+  Plotly.restyle(viewer, {visible:visibility}, indices);
 }
 for(const name of Object.keys(settings.groups))document.getElementById(name).addEventListener('change',updateVisibility);
+document.getElementById('camera-mode').addEventListener('change',updateVisibility);
+// Preserve original coordinates: scaling always happens about each camera center,
+// never the world origin, and repeated slider changes do not accumulate drift.
+const centers=viewer.data[settings.groups.cameras.find(i=>viewer.data[i].mode==='markers')];
+const cameraGeometry=viewer.data.flatMap((trace,index)=>trace.meta?.camera_geometry ? [{
+  index, stride:centers.x.length ? trace.x.length/centers.x.length : 0,
+  x:Array.from(trace.x), y:Array.from(trace.y), z:Array.from(trace.z)
+}] : []);
+let resizingCameras=false;
+async function updateCameraSize(){
+  if(resizingCameras || !centers.x.length)return;
+  resizingCameras=true;
+  const scale=Number(document.getElementById('camera-size').value);
+  const coordinates={};
+  for(const axis of ['x','y','z'])coordinates[axis]=cameraGeometry.map(trace=>
+    trace[axis].map((value,i)=>{
+      if(value===null)return null;
+      const center=centers[axis][Math.floor(i/trace.stride)];
+      return center+(value-center)*scale;
+    }));
+  try{
+    await Plotly.restyle(viewer,coordinates,cameraGeometry.map(trace=>trace.index));
+  }finally{resizingCameras=false;}
+  if(scale!==Number(document.getElementById('camera-size').value))requestAnimationFrame(updateCameraSize);
+}
+document.getElementById('camera-size').addEventListener('input',event=>{
+  document.getElementById('camera-size-value').textContent=Number(event.target.value).toFixed(2)+'×';
+  requestAnimationFrame(updateCameraSize);
+});
 document.getElementById('point-size').addEventListener('input',event=>Plotly.restyle(viewer,{'marker.size':Number(event.target.value)},[0]));
 function resetView(){
   const camera=JSON.parse(JSON.stringify(settings.views[document.getElementById('view-up').value]));

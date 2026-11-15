@@ -246,9 +246,16 @@ def _error_stats(errors):
     finite = errors[torch.isfinite(errors)]
     if len(finite) == 0:
         return {'observations': len(errors), 'finite': 0, 'rms': None, 'median': None, 'p90': None}
+    # quantile() rejects more than 2**24 elements. Select the two adjacent
+    # order statistics instead, with the same linear interpolation convention.
+    rank = float(finite.new_tensor(.9) * (len(finite) - 1))
+    low, high = math.floor(rank), math.ceil(rank)
+    a = finite.kthvalue(low + 1).values
+    b = finite.kthvalue(high + 1).values if high != low else a
+    p90 = torch.lerp(a, b, rank - low)
     return {'observations': len(errors), 'finite': len(finite),
             'rms': float(finite.square().mean().sqrt()), 'median': float(finite.median()),
-            'p90': float(torch.quantile(finite, .9))}
+            'p90': float(p90)}
 
 
 def _compact(points, observations, keep, min_views):
@@ -299,24 +306,9 @@ def filter_tracks(frames, rotations, centers, points3d, observations, intrinsics
         keep &= cosine >= math.cos(math.radians(max_angular_error))
     points3d, observations = _compact(points3d, observations, keep, cfg.min_views_per_track)
     if len(observations) and cfg.min_tri_angle:
-        # Triangulation angle uses point-to-camera rays, independent of noisy pixels.
-        # Compare each camera to all observations of the same track in batches.
-        point_ids, frame_ids, _ = observations.T
-        directions = F.normalize(points3d[point_ids] - centers[frame_ids], dim=-1)
-        counts = torch.bincount(point_ids, minlength=len(points3d))
-        order = point_ids.argsort(stable=True)
-        offsets = counts.cumsum(0) - counts
-        slots = torch.empty_like(point_ids)
-        slots[order] = torch.arange(len(order), device=order.device) - offsets[point_ids[order]]
-        padded = directions.new_zeros((len(points3d), int(counts.max()), 3))
-        valid = torch.zeros(padded.shape[:2], dtype=torch.bool, device=padded.device)
-        padded[point_ids, slots], valid[point_ids, slots] = directions, True
-        minimum = points3d.new_ones(len(points3d))
-        for slot in range(padded.shape[1]):
-            cosine = (padded * padded[:, slot:slot + 1]).sum(-1).abs()
-            pair_valid = valid & valid[:, slot:slot + 1]
-            minimum = torch.minimum(minimum, cosine.masked_fill(~pair_valid, 1).amin(-1))
-        good_tracks = minimum <= math.cos(math.radians(cfg.min_tri_angle))
+        from .track_angles import triangulation_mask
+        point_ids = observations[:, 0]
+        good_tracks = triangulation_mask(centers, points3d, observations, cfg.min_tri_angle)
         points3d, observations = _compact(points3d, observations, good_tracks[point_ids], cfg.min_views_per_track)
     return _active_component(points3d, observations, len(frames), cfg)
 

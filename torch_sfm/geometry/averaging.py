@@ -195,7 +195,8 @@ def _spanning_initialization(nodes, edges, reference):
             index = parent[index]
         return index
 
-    for (i, j), geometry in sorted(edges.items(), key=lambda item: len(item[1].matches.indices), reverse=True):
+    for (i, j), geometry in sorted(edges.items(), key=lambda item: (item[1].score if hasattr(item[1], 'score')
+                                                   else len(item[1].matches.indices)), reverse=True):
         a, b = mapping[i], mapping[j]
         ra, rb = find(a), find(b)
         if ra == rb:

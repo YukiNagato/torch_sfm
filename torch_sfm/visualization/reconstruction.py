@@ -197,18 +197,29 @@ def build_figure(result, *, colors=None, image_paths=None, image_sizes=None,
         name = str(paths[frame_id]) if frame_id < len(paths) else f'frame {frame_id}'
         names.append(f'Camera {frame_id}: {escape(Path(name).name)}')
     figure.add_trace(go.Scatter3d(name='Camera frustums', mode='lines', x=lines[0], y=lines[1], z=lines[2],
-        line={'color': '#56d6e6', 'width': 3}, hoverinfo='skip'))
+        line={'color': '#56d6e6', 'width': 3}, hoverinfo='skip', meta={'camera_geometry': True}))
     figure.add_trace(go.Scatter3d(name='Camera centers', mode='markers',
         x=active_centers[:, 0].tolist(), y=active_centers[:, 1].tolist(), z=active_centers[:, 2].tolist(),
         marker={'size': 3, 'color': '#ffb86b', 'line': {'color': '#fff1d6', 'width': .5}},
         text=names, hovertemplate='%{text}<br>X %{x:.4f}<br>Y %{y:.4f}<br>Z %{z:.4f}<extra></extra>'))
+    trajectory = [[], [], []]
+    previous = None
+    for frame_id in camera_ids.tolist():
+        # Sequence folders (e.g. LaMAR) must not be joined across recordings.
+        if previous is not None and max(previous, frame_id) < len(paths):
+            if Path(paths[previous]).parent != Path(paths[frame_id]).parent:
+                for coordinates in trajectory:
+                    coordinates.append(None)
+        for axis in range(3):
+            trajectory[axis].append(float(centers[frame_id, axis]))
+        previous = frame_id
     figure.add_trace(go.Scatter3d(name='Image-order links', mode='lines', visible=False,
-        x=active_centers[:, 0].tolist(), y=active_centers[:, 1].tolist(), z=active_centers[:, 2].tolist(),
+        x=trajectory[0], y=trajectory[1], z=trajectory[2],
         line={'color': '#ffb86b', 'width': 3}, hoverinfo='skip'))
     for axis, color in enumerate(('#ff6464', '#69da95', '#719dff')):
         figure.add_trace(go.Scatter3d(name=f'Camera {"XYZ"[axis]} axis', mode='lines', visible=False,
             x=axes[axis][0], y=axes[axis][1], z=axes[axis][2],
-            line={'color': color, 'width': 3}, hoverinfo='skip'))
+            line={'color': color, 'width': 3}, hoverinfo='skip', meta={'camera_geometry': True}))
     vertices = torch.cat(frustum_vertices) if frustum_vertices else active_centers
     full = _ranges(torch.cat((cloud, vertices)))
     if len(cloud) > 10:

@@ -19,6 +19,7 @@ from .bundle_adjustment import (
 )
 from .triangulation import IncrementalTriangulator
 from .camera_recovery import recover_cameras
+from .track_angles import triangulation_mask
 
 
 def normalize_reconstruction(centers, points, registered):
@@ -34,29 +35,6 @@ def normalize_reconstruction(centers, points, registered):
     extent = (ordered[high] - ordered[low]).norm()
     scale = 10 / extent if float(extent) >= torch.finfo(centers.dtype).eps else 1.0
     return (centers - origin) * scale, (points - origin) * scale
-
-
-def triangulation_mask(centers, points, observations, minimum):
-    if not len(points) or minimum == 0:
-        return torch.ones(len(points), dtype=torch.bool, device=points.device)
-    pid, fid, _ = observations.T
-    directions = F.normalize(points[pid] - centers[fid], dim=-1)
-    counts = torch.bincount(pid, minlength=len(points))
-    order = pid.argsort(stable=True)
-    offsets = counts.cumsum(0) - counts
-    slots = torch.empty_like(pid)
-    slots[order] = torch.arange(len(order), device=points.device) - offsets[pid[order]]
-    padded = points.new_zeros((len(points), int(counts.max()), 3))
-    valid = torch.zeros(padded.shape[:2], dtype=torch.bool, device=points.device)
-    padded[pid, slots], valid[pid, slots] = directions, True
-    minimum_cosine = points.new_ones(len(points))
-    for slot in range(padded.shape[1]):
-        cosine = (padded * padded[:, slot : slot + 1]).sum(-1).abs()
-        pairs = valid & valid[:, slot : slot + 1]
-        minimum_cosine = torch.minimum(
-            minimum_cosine, cosine.masked_fill(~pairs, 1).amin(-1)
-        )
-    return minimum_cosine <= math.cos(math.radians(minimum))
 
 
 def filter_reconstruction(
@@ -111,7 +89,18 @@ def global_bundle_adjustment(
     registered,
     cfg,
     geometries=None,
+    *,
+    resume_refinement=False,
 ):
+    """Refine a global reconstruction, optionally resuming before refinement 1.
+
+    A resumed input must contain the poses, points, observations, intrinsics,
+    registrations and verified graph saved after initial retriangulation.
+    Initial global BA and track creation are skipped; all refinement/filtering
+    and camera-recovery stages retain their normal settings.
+    """
+    if resume_refinement and not (cfg.enabled and cfg.retriangulate and geometries):
+        raise ValueError('Resuming refinement requires enabled BA, retriangulation and a graph')
     rotations = rotations.detach().clone()
     centers = centers.detach().to(rotations).clone()
     points = points3d.detach().to(rotations).clone()
@@ -135,6 +124,7 @@ def global_bundle_adjustment(
         "filters": [],
         "refinements": [],
         "camera_recovery": [],
+        "resumed_refinement": resume_refinement,
     }
     summaries = []
     if not cfg.enabled or not len(observations):
@@ -229,7 +219,7 @@ def global_bundle_adjustment(
             raise RuntimeError("No tracks remain after GLOMAP filtering")
         return removed
 
-    iteration = 0
+    iteration = cfg.num_rounds if resume_refinement else 0
     while iteration < cfg.num_rounds:
         if cfg.fixed_rotation_iterations:
             solve_stage(
@@ -247,9 +237,10 @@ def global_bundle_adjustment(
                 break
             iteration += 1
         iteration += 1
-    filter_stage(
-        "global_final", cfg.max_normalized_reprojection_error, angle=cfg.min_tri_angle
-    )
+    if not resume_refinement:
+        filter_stage(
+            "global_final", cfg.max_normalized_reprojection_error, angle=cfg.min_tri_angle
+        )
 
     if cfg.retriangulate and geometries:
         old_points = len(points)
@@ -266,23 +257,28 @@ def global_bundle_adjustment(
             frames, geometries, registered, cfg.triangulation
         )
         triangulator.update_geometry(rotations, centers, intrinsics)
-        added = triangulator.triangulate()
-        changed = triangulator.complete_and_merge()
-        retriangulated = triangulator.retriangulate()
-        points, observations = triangulator.export()
-        stats["retriangulation"] = {
-            "points_before": old_points,
-            "points_after": len(points),
-            "observations_after": len(observations),
-            "added": added,
-            **changed,
-            "retriangulated": retriangulated,
-            "candidate_batching": (
-                dict(triangulator.candidate_cache.stats)
-                if triangulator.candidate_cache
-                else None
-            ),
-        }
+        if resume_refinement:
+            triangulator.load(points, observations)
+            stats['retriangulation'] = dict(resumed=True, points_after=len(points),
+                                            observations_after=len(observations))
+        else:
+            added = triangulator.triangulate()
+            changed = triangulator.complete_and_merge()
+            retriangulated = triangulator.retriangulate()
+            points, observations = triangulator.export()
+            stats["retriangulation"] = {
+                "points_before": old_points,
+                "points_after": len(points),
+                "observations_after": len(observations),
+                "added": added,
+                **changed,
+                "retriangulated": retriangulated,
+                "candidate_batching": (
+                    dict(triangulator.candidate_cache.stats)
+                    if triangulator.candidate_cache
+                    else None
+                ),
+            }
         if not len(observations):
             raise RuntimeError("No tracks remain after GLOMAP retriangulation")
         pending_recovery = None

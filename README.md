@@ -19,7 +19,7 @@ Core dependencies include [torchls](https://github.com/YukiNagato/torchls), inst
 The project currently implements a complete global SfM [pipeline](torch_sfm/pipeline/glomap.py) following GLOMAP, from image retrieval and feature matching to geometric verification, rotation and position averaging, triangulation, and bundle adjustment. It also supports COLMAP model export and interactive reconstruction visualization.
 See the [ETH3D and Mip-NeRF 360 benchmarks](docs/benchmarks/eth3d_mip360_glomap.md) for runtime and accuracy comparisons with COLMAP GLOMAP using Ceres and Caspar.
 
-## Try RaCo + FlexGlue
+### Try RaCo + FlexGlue
 
 You can swap the correspondence method for **RaCo + FlexGlue**, combining learned keypoint detection and matching with covisibility-based pair filtering (which is pretty cool). The rest of the reconstruction pipeline stays the same.
 
@@ -32,3 +32,11 @@ python examples/flexglue_glomap.py /path/to/workspace
 The workspace contains `images.txt` (one absolute image path per line) and `intrinsics.txt` (`fx fy cx cy`, either one shared row or one row per image). Optional frontend installation instructions are included in the example.
 
 See the [ETH3D FlexGlue experiment](docs/benchmarks/eth3d_flexglue.md) for runtime, pose accuracy, and pair-filtering results compared with the LoMa frontend in TorchSfM.
+
+## GlueMap Pipeline
+
+The [GlueMap-style pipeline](torch_sfm/pipeline/gluemap.py) uses learned pose and depth priors on local image groups, checks depth consistency, fuses local poses into a global reconstruction, and refines it with triangulation and bundle adjustment.
+
+### Try LaMAR
+
+The [LaMAR example](examples/lamar_gluemap.py) includes data preparation, sequence-aware retrieval, and two-round refinement. Compared with standard GlueMap, this configuration uses **Solv3R** priors and **RaCo + FlexGlue** tracks, omits virtual tracks, and runs BA with **torchls / Warp PCG**. It fixes the supplied intrinsics and applies GLOMAP-style geometric verification before refinement. See the [LaMAR HGE results](docs/benchmarks/lamar_hge_gluemap.md).

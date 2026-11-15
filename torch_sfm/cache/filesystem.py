@@ -31,7 +31,10 @@ class FileSystemCache(Cache):
         if kind == 'retrieval':
             return (np.loadtxt(path, dtype=np.int32).reshape(-1, 2) if path.stat().st_size
                     else np.empty((0, 2), dtype=np.int32))
-        return torch.load(path, map_location='cpu', weights_only=True)
+        # Dense feature maps can exceed RAM across thousands of images. Let
+        # the OS page cached features in only when the matcher needs them.
+        return torch.load(path, map_location='cpu', weights_only=True,
+                          mmap=kind == 'keypoints')
 
     def invalidate_two_view(self, keys):
         for key in keys:

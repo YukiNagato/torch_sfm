@@ -21,6 +21,45 @@ from .triangulation import TriangulationConfig
 from .two_view import camera_matrix
 
 
+class _NeighborCSR:
+    """Static observation graph; padding exists only for requested rows."""
+
+    def __init__(self, offsets, indices, max_degree):
+        self.offsets = offsets
+        self.indices = indices
+        self.max_degree = max_degree
+
+    @classmethod
+    def from_sorted_keys(cls, keys, count):
+        # Keys are unique and sorted by (source, destination).
+        degree = torch.bincount(keys // max(count, 1), minlength=count)
+        offsets = torch.cat((degree.new_zeros(1), degree.cumsum(0)))
+        return cls(offsets, keys % max(count, 1), int(degree.max()) if count else 0)
+
+    def padded(self, rows):
+        starts = self.offsets[rows]
+        lengths = self.offsets[rows + 1] - starts
+        width = int(lengths.max()) if len(rows) else 0
+        if not width:
+            return self.indices.new_empty(len(rows), 0)
+        columns = torch.arange(width, device=rows.device)
+        positions = starts[:, None] + columns
+        values = self.indices[positions.clamp_max(len(self.indices) - 1)]
+        return torch.where(columns < lengths[:, None], values, -1)
+
+    def edges(self, rows):
+        """Expand only real edges, in source row and then neighbor order."""
+        starts = self.offsets[rows]
+        lengths = self.offsets[rows + 1] - starts
+        ends = lengths.cumsum(0)
+        size = int(ends[-1]) if len(rows) else 0
+        source = torch.repeat_interleave(rows, lengths, output_size=size)
+        positions = torch.arange(size, device=rows.device)
+        positions += torch.repeat_interleave(starts - (ends - lengths), lengths,
+                                             output_size=size)
+        return source, self.indices[positions]
+
+
 class TensorTriangulator:
     def __init__(self, frames, geometries, registered, config=None):
         self.config = config or TriangulationConfig(implementation="tensor")
@@ -42,7 +81,12 @@ class TensorTriangulator:
                 with Image.open(frame.frame_path) as im:
                     size = (im.height, im.width)
             self.sizes.append(size)
-        edges = []
+        n = self.storage.capacity
+        if n > math.isqrt(torch.iinfo(torch.int64).max):
+            raise ValueError("Observation graph exceeds int64 edge-key capacity")
+        edge_count = 2 * sum(len(g.matches.indices) for g in geometries.values())
+        keys = torch.empty(edge_count, dtype=torch.long, device=device)
+        offset = 0
         for (i, j), geometry in sorted(geometries.items()):
             indices = geometry.matches.indices.to(device=device, dtype=torch.long)
             a = self.storage.global_ids(
@@ -52,20 +96,20 @@ class TensorTriangulator:
                 torch.full_like(indices[:, 1], j), indices[:, 1]
             )
             self.pairs[i, j] = torch.stack((a, b), -1)
-            edges.extend((torch.stack((a, b), -1), torch.stack((b, a), -1)))
-        edges = (
-            torch.unique(torch.cat(edges), dim=0, sorted=True)
-            if edges
-            else torch.empty(0, 2, dtype=torch.long, device=device)
-        )
-        n = self.storage.capacity
-        degree = torch.bincount(edges[:, 0], minlength=n)
+            size = len(a)
+            keys[offset : offset + size] = a * n + b
+            keys[offset + size : offset + 2 * size] = b * n + a
+            offset += 2 * size
+        keys = torch.unique(keys, sorted=True)
+        self.neighbors = _NeighborCSR.from_sorted_keys(keys, n)
+        del keys
+        degree = self.neighbors.offsets[1:] - self.neighbors.offsets[:-1]
         # Graph preprocessing for non-default transitivity happens only once.
-        # Its final representation still has one fixed-width row per observation.
+        # Preserve the existing breadth-first neighbor order for expanded rows.
         if self.config.max_transitivity > 1:
-            adjacency = [[] for _ in range(n)]
-            for a, b in edges.cpu().tolist():
-                adjacency[a].append(b)
+            offsets = self.neighbors.offsets.cpu().tolist()
+            indices = self.neighbors.indices.cpu().tolist()
+            adjacency = [indices[offsets[a] : offsets[a + 1]] for a in range(n)]
             expanded = []
             for a, adjacent in enumerate(adjacency):
                 if not adjacent:
@@ -83,31 +127,22 @@ class TensorTriangulator:
             expanded = torch.tensor(expanded, dtype=torch.long, device=device).reshape(
                 -1, 2
             )
+            self.local_neighbors = self._pack_edges(expanded, n)
         else:
-            expanded = edges
-        self.neighbors = self._pack_edges(edges, n)
-        self.local_neighbors = (
-            self.neighbors if expanded is edges else self._pack_edges(expanded, n)
-        )
+            self.local_neighbors = self.neighbors
         self.degree = degree
         self.pure_two_view = degree == 1
-        if self.neighbors.shape[1]:
-            self.pure_two_view &= degree[self.neighbors[:, 0].clamp_min(0)] == 1
+        single = torch.where(self.pure_two_view)[0]
+        adjacent = self.neighbors.indices[self.neighbors.offsets[single]]
+        self.pure_two_view[single] &= degree[adjacent] == 1
 
     @staticmethod
     def _pack_edges(edges, n):
-        if not len(edges):
-            return torch.empty(n, 0, dtype=torch.long, device=edges.device)
         edges = edges[torch.argsort(edges[:, 0], stable=True)]
         degree = torch.bincount(edges[:, 0], minlength=n)
-        width = int(degree.max())
-        neighbors = torch.full((n, width), -1, dtype=torch.long, device=edges.device)
-        start = degree.cumsum(0) - degree
-        neighbors[
-            edges[:, 0],
-            torch.arange(len(edges), device=edges.device) - start[edges[:, 0]],
-        ] = edges[:, 1]
-        return neighbors
+        offsets = torch.cat((degree.new_zeros(1), degree.cumsum(0)))
+        return _NeighborCSR(offsets, edges[:, 1].contiguous(),
+                            int(degree.max()) if n else 0)
 
     def update_geometry(self, rotations, centers, intrinsics, *, registered=None):
         """Refresh geometry and optionally camera registration, reusing topology."""
@@ -505,7 +540,7 @@ class TensorTriangulator:
             ids = ids[(self.degree[ids] > 0) & s.obs_valid[ids]]
             if not len(ids):
                 continue
-            neighbors = self.local_neighbors[ids]
+            neighbors = self.local_neighbors.padded(ids)
             added += self._continue(
                 ids, neighbors, self.config.continue_max_angle_error
             )
@@ -515,17 +550,16 @@ class TensorTriangulator:
 
     def _edge_batches(self, sources=None):
         s = self.storage
-        if not self.neighbors.shape[1]:
+        if not self.neighbors.max_degree:
             return
         if sources is None:
             sources = torch.where((self.degree > 0) & s.obs_valid)[0]
-        batch = max(1, self.config.batch_max_observations // self.neighbors.shape[1])
+        batch = max(1, self.config.batch_max_observations // self.neighbors.max_degree)
         for start in range(0, len(sources), batch):
             src = sources[start : start + batch]
-            dst = self.neighbors[src]
-            valid = (dst >= 0) & s.obs_valid[dst.clamp_min(0)]
-            row, col = torch.where(valid)
-            yield src[row], dst[row, col]
+            src, dst = self.neighbors.edges(src)
+            valid = s.obs_valid[dst]
+            yield src[valid], dst[valid]
 
     def _complete(self):
         s = self.storage
@@ -650,7 +684,7 @@ class TensorTriangulator:
             for reverse in (False, True):
                 current = matches.flip(-1) if reverse else matches
                 unique = torch.unique(current[:, 0], sorted=True)
-                neighbors = self.local_neighbors[unique]
+                neighbors = self.local_neighbors.padded(unique)
                 # Restrict continuation to this image pair's direct matches.
                 target_image = pair[0] if reverse else pair[1]
                 neighbors = torch.where(

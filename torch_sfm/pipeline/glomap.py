@@ -1,8 +1,10 @@
 from dataclasses import dataclass, field, asdict, replace
 from torch_sfm.core import Frame, SFMStorage
 from torch_sfm.utils import Timer
-from torch_sfm.cache import create_cache, copy_cache
+from torch_sfm.cache import FileSystemCache, create_cache, copy_cache
 import numpy as np
+import hashlib
+import json
 import torch
 from pathlib import Path
 from torch_sfm.retrieval import get_retrieval, RetrievalResult
@@ -86,6 +88,8 @@ class GlomapConfig:
     flexglue: FlexGlueConfig = field(default_factory=FlexGlueConfig)
     retrieval_top_k: int = 10
     retrieval_threshold: float = 0.5
+    retrieval_sequences: Path | None = None  # JSON start/end ranges aligned with images.txt
+    retrieval_sequential_neighbors: int = 30
 
     cache_frame_images: bool = True
     use_cache: bool = True
@@ -152,6 +156,7 @@ class GlomapPipeline:
         self.matcher = None
         self._frontend_options = None
         self.storage = None
+        self.sequential_edges = set()
 
     def _prepare_frontend_config(self):
         """Do not reuse loaded networks after changing frontend settings."""
@@ -238,6 +243,8 @@ class GlomapPipeline:
     @timer
     @torch.inference_mode()
     def get_retrieval_pairs(self):
+        if self.cfg.retrieval_sequences is not None:
+            return self._get_sequence_retrieval_pairs()
         cached = (self.cache.load('retrieval') if self.cfg.use_cache
                   and not self.cfg.update_cache_for_retrieval else None)
         if cached is not None:
@@ -269,6 +276,46 @@ class GlomapPipeline:
                 self.cache.save('retrieval', retrieval_pairs)
 
         return retrieval_pairs
+
+    def _get_sequence_retrieval_pairs(self):
+        from torch_sfm.retrieval.sequential import load_sequence_ids, retrieve_sequence_pairs
+        sequence_path = Path(self.cfg.retrieval_sequences)
+        ids = load_sequence_ids(sequence_path, len(self.frames))
+        identity = dict(method=self.cfg.retrieval_method, images=[str(p.resolve()) for p in self.image_list])
+        options = dict(version=1, **identity, global_neighbors=self.cfg.retrieval_top_k,
+                       sequential_neighbors=self.cfg.retrieval_sequential_neighbors,
+                       sequences_sha256=hashlib.sha256(sequence_path.read_bytes()).hexdigest())
+        path = self.cache_root / 'retrieval_sequence.pt'
+        cached = (torch.load(path, map_location='cpu', weights_only=True)
+                  if self.cfg.use_cache and not self.cfg.update_cache_for_retrieval and path.exists() else None)
+        if cached is not None and cached['options'] == options:
+            pairs, temporal = cached['pairs'].numpy(), cached['sequential_edges'].numpy()
+        else:
+            descriptor_path = self.cache_root / 'retrieval_descriptors.pt'
+            descriptors = (torch.load(descriptor_path, map_location='cpu', weights_only=True)
+                           if self.cfg.use_cache and descriptor_path.exists() else None)
+            retrieval = get_retrieval(self.cfg.retrieval_method)
+            if descriptors is not None and descriptors['identity'] == identity:
+                features = list(descriptors['features'].to(retrieval.device).unbind())
+            else:
+                features = [retrieval.extract(load_frame_image(frame))
+                            for frame in tqdm(self.frames, desc='Extract sequence retrieval descriptors')]
+                if self.cfg.use_cache:
+                    descriptor_path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = descriptor_path.with_suffix('.tmp')
+                    torch.save(dict(identity=identity, features=torch.stack(features).cpu()), temporary)
+                    temporary.replace(descriptor_path)
+            pairs, temporal = retrieve_sequence_pairs(retrieval.similarity(features), ids,
+                global_neighbors=self.cfg.retrieval_top_k,
+                sequential_neighbors=self.cfg.retrieval_sequential_neighbors)
+            if self.cfg.use_cache:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix('.tmp')
+                torch.save(dict(options=options, pairs=torch.from_numpy(pairs),
+                                sequential_edges=torch.from_numpy(temporal)), temporary)
+                temporary.replace(path)
+        self.sequential_edges = set(map(tuple, temporal.tolist()))
+        return pairs
     
     @timer
     @torch.inference_mode()
@@ -306,6 +353,10 @@ class GlomapPipeline:
                         'image_size': frame.image_size,
                         'options': feature_options,
                     }, frame.frame_idx)
+                    if isinstance(self.cache, FileSystemCache) and frame.dense_features is not None:
+                        # Newly extracted maps should use the same bounded-RAM
+                        # path as cache hits, rather than accumulate in memory.
+                        frame.dense_features = self.cache.load('keypoints', frame.frame_idx)['dense_features']
 
         if hasattr(self.extractor, 'release'):
             self.extractor.release()
@@ -328,6 +379,11 @@ class GlomapPipeline:
             data = (self.cache.load('correspondences', key) if self.cfg.use_cache
                     and not self.cfg.update_cache_for_correspondence
                     and not self.cfg.update_cache_for_keypoints else None)
+            if (data is None and self.cfg.correspondence_method == 'flexglue' and self.cfg.use_cache
+                    and not self.cfg.update_cache_for_correspondence and not self.cfg.update_cache_for_keypoints):
+                reverse = self.cache.load('correspondences', key[::-1])
+                if reverse is not None:
+                    data = dict(reverse, indices=reverse['indices'][:, [1, 0]])
             if data is not None and match_options is not None and data.get('options') != match_options:
                 data = None
             if data is not None:
@@ -364,7 +420,8 @@ class GlomapPipeline:
 
     @timer
     def get_two_view_geometries(self, frames: List[Frame], correspondences: dict, intrinsic: torch.Tensor,
-                                *, config=None, cache_kind='two_view'):
+                                *, config=None, cache_kind='two_view', cache=None):
+        """Verify matches, optionally storing geometry in a separate cache."""
         config = self.cfg.two_view if config is None else config
         device = torch.device(self.cfg.geometry_device or ('cuda' if torch.cuda.is_available() else 'cpu'))
         matrices = camera_matrix(intrinsic.to(device=device, dtype=torch.float64))
@@ -372,7 +429,9 @@ class GlomapPipeline:
             matrices = matrices.expand(len(frames), 3, 3)
         if matrices.shape != (len(frames), 3, 3):
             raise ValueError('Provide shared pinhole intrinsics or one camera matrix per frame')
-        self._prepare_cache(frames, intrinsic)
+        if cache is None:
+            self._prepare_cache(frames, intrinsic)
+            cache = self.cache
         sizes = []
         for frame in frames:
             if frame.image is not None:
@@ -406,7 +465,7 @@ class GlomapPipeline:
                 'points1': frame1.keypoints_2d[matches.indices[:, 1].to(frame1.keypoints_2d.device)].cpu(),
             }
             data = None
-            cached = self.cache.load(cache_kind, key) if self.cfg.use_cache and not refresh else None
+            cached = cache.load(cache_kind, key) if self.cfg.use_cache and not refresh else None
             if cached is not None:
                 if (cached.get('version') == 3 and _geometry_cache_options(cached['options']) == options
                         and cached['sizes'] == (sizes[i], sizes[j])
@@ -435,7 +494,7 @@ class GlomapPipeline:
                             for key, value in vars(geometry).items() if key != 'matches'}
                     data['indices'] = geometry.matches.indices.cpu()
                     data['scores'] = geometry.matches.scores.cpu()
-                    self.cache.save(cache_kind, {'version': 3, 'options': options,
+                    cache.save(cache_kind, {'version': 3, 'options': options,
                         'sizes': (sizes[i], sizes[j]), 'inputs': inputs, 'geometry': data}, key)
         from torch_sfm.geometry.two_view_poses import complete_fundamental_poses
         complete_fundamental_poses(geometries, frames, intrinsic, config)
