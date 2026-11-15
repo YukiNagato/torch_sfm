@@ -52,6 +52,10 @@ Position NRMSE (%) = 100 × RMS(aligned estimated camera centers − reference c
 
 Rotation error uses the rotation from the same alignment and is reported as the median angular error. Lower is better for both metrics. ETH3D uses official calibrated poses, but this is not the official ETH3D evaluation protocol. Mip360 references are the COLMAP reconstructions provided with the dataset, **not independent ground truth**; these metrics measure agreement with that reference. Full registration does not imply correct structure.
 
+Joint pose AUC@3° evaluates all unordered camera pairs `i < j` in input image order, without global alignment. Each pair uses `e = max(rotation_error, translation_direction_error)`. Translation error is sign-invariant: `acos(abs(dot(normalize(t_pred), normalize(t_ref))))`, so opposite directions are equivalent.
+
+Following the [SuperGlue error-recall integration convention](https://github.com/magicleap/SuperGluePretrainedNetwork/blob/master/models/utils.py), we sort the errors, prepend `(error=0, recall=0)`, integrate the linearly interpolated recall curve using trapezoids up to 3°, and divide by 3°. Recall is held constant from the last error below 3° to the cutoff. Results are percentages (higher is better), averaged equally across scenes. Failed or missing predictions remain in the denominator with infinite error; zero reference baselines are excluded (none occur here). Evaluation uses saved final poses and does not change reconstruction timings.
+
 ## ETH3D
 
 Both methods register **898 / 898** images, producing one model per scene. Caspar has not been tested.
@@ -72,33 +76,35 @@ Times are in seconds, summed over all 25 scenes.
 
 Each cell lists **TorchSfM / Ceres CPU**. Runtime is the four-stage total in seconds; position NRMSE is a percentage. All scenes are included, including reconstructions with large deviations from the reference.
 
-| Scene | Images | Comparable stage total (s) | Position NRMSE (%) |
-| --- | --- | --- | --- |
-| courtyard | 38 | 18.75 / 14.38 | 75.318 / 75.315 |
-| delivery_area | 44 | 18.33 / 18.29 | 0.085 / 0.085 |
-| electro | 45 | 19.73 / 15.02 | 0.129 / 0.127 |
-| facade | 76 | 26.67 / 28.10 | 96.057 / 95.257 |
-| kicker | 31 | 10.96 / 9.83 | 0.057 / 0.060 |
-| meadow | 15 | 13.41 / 2.54 | 0.438 / 0.417 |
-| office | 26 | 10.10 / 5.40 | 0.608 / 0.632 |
-| pipes | 14 | 8.49 / 3.98 | 0.161 / 0.154 |
-| playground | 38 | 14.40 / 12.03 | 0.129 / 0.125 |
-| relief | 31 | 16.03 / 11.08 | 21.380 / 10.151 |
-| relief_2 | 31 | 12.02 / 10.72 | 0.081 / 0.079 |
-| terrace | 23 | 11.40 / 6.75 | 0.125 / 0.123 |
-| terrains | 42 | 19.05 / 14.97 | 0.074 / 0.069 |
-| botanical_garden | 30 | 15.70 / 10.01 | 0.135 / 0.151 |
-| boulders | 26 | 13.31 / 7.83 | 0.157 / 0.165 |
-| bridge | 110 | 40.83 / 57.02 | 93.829 / 93.836 |
-| door | 7 | 4.87 / 1.86 | 0.034 / 0.034 |
-| exhibition_hall | 68 | 27.88 / 28.85 | 97.407 / 95.544 |
-| lecture_room | 23 | 11.79 / 6.78 | 0.194 / 78.105 |
-| living_room | 65 | 20.39 / 18.07 | 55.798 / 54.683 |
-| lounge | 10 | 9.77 / 2.30 | 47.208 / 45.330 |
-| observatory | 27 | 9.54 / 8.62 | 0.475 / 0.482 |
-| old_computer | 54 | 18.66 / 19.38 | 93.857 / 93.866 |
-| statue | 11 | 6.87 / 4.64 | 0.024 / 0.027 |
-| terrace_2 | 13 | 6.89 / 4.84 | 0.144 / 0.146 |
+| Scene | Images | Comparable stage total (s) | Position NRMSE (%) | AUC@3° (%) |
+| --- | --- | --- | --- | --- |
+| courtyard | 38 | 18.75 / 14.38 | 75.318 / 75.315 | 49.03 / 49.60 |
+| delivery_area | 44 | 18.33 / 18.29 | 0.085 / 0.085 | 97.89 / 97.90 |
+| electro | 45 | 19.73 / 15.02 | 0.129 / 0.127 | 96.61 / 96.61 |
+| facade | 76 | 26.67 / 28.10 | 96.057 / 95.257 | 64.18 / 64.07 |
+| kicker | 31 | 10.96 / 9.83 | 0.057 / 0.060 | 98.40 / 98.34 |
+| meadow | 15 | 13.41 / 2.54 | 0.438 / 0.417 | 89.93 / 91.40 |
+| office | 26 | 10.10 / 5.40 | 0.608 / 0.632 | 82.87 / 82.37 |
+| pipes | 14 | 8.49 / 3.98 | 0.161 / 0.154 | 96.76 / 96.91 |
+| playground | 38 | 14.40 / 12.03 | 0.129 / 0.125 | 97.21 / 97.11 |
+| relief | 31 | 16.03 / 11.08 | 21.380 / 10.151 | 85.53 / 91.76 |
+| relief_2 | 31 | 12.02 / 10.72 | 0.081 / 0.079 | 98.21 / 98.32 |
+| terrace | 23 | 11.40 / 6.75 | 0.125 / 0.123 | 97.63 / 97.71 |
+| terrains | 42 | 19.05 / 14.97 | 0.074 / 0.069 | 97.92 / 98.04 |
+| botanical_garden | 30 | 15.70 / 10.01 | 0.135 / 0.151 | 96.18 / 95.86 |
+| boulders | 26 | 13.31 / 7.83 | 0.157 / 0.165 | 95.93 / 95.95 |
+| bridge | 110 | 40.83 / 57.02 | 93.829 / 93.836 | 48.50 / 48.26 |
+| door | 7 | 4.87 / 1.86 | 0.034 / 0.034 | 97.63 / 97.58 |
+| exhibition_hall | 68 | 27.88 / 28.85 | 97.407 / 95.544 | 16.53 / 18.64 |
+| lecture_room | 23 | 11.79 / 6.78 | 0.194 / 78.105 | 95.03 / 78.50 |
+| living_room | 65 | 20.39 / 18.07 | 55.798 / 54.683 | 79.93 / 79.88 |
+| lounge | 10 | 9.77 / 2.30 | 47.208 / 45.330 | 60.87 / 60.88 |
+| observatory | 27 | 9.54 / 8.62 | 0.475 / 0.482 | 86.95 / 86.68 |
+| old_computer | 54 | 18.66 / 19.38 | 93.857 / 93.866 | 34.41 / 34.67 |
+| statue | 11 | 6.87 / 4.64 | 0.024 / 0.027 | 99.26 / 99.21 |
+| terrace_2 | 13 | 6.89 / 4.84 | 0.144 / 0.146 | 96.63 / 96.60 |
+
+Scene means — **AUC@3°: 82.40 / 82.11%**, in the same method order.
 
 ## Mip-NeRF 360
 
@@ -136,18 +142,19 @@ Each cell lists **TorchSfM / Ceres CPU / Caspar**, in seconds. Triangulation + B
 
 Each cell lists **TorchSfM / Ceres CPU / Caspar**.
 
-| Scene | Position NRMSE (%) | Median rotation error (°) |
-| --- | --- | --- |
-| bicycle | 0.157 / 0.178 / 0.197 | 0.026 / 0.026 / 0.035 |
-| bonsai | 0.155 / 0.155 / 0.164 | 0.119 / 0.117 / 0.126 |
-| counter | 0.030 / 0.027 / 0.079 | 0.031 / 0.029 / 0.039 |
-| flowers | 0.226 / 0.227 / 0.231 | 0.098 / 0.094 / 0.086 |
-| garden | 0.036 / 0.037 / 0.043 | 0.028 / 0.027 / 0.034 |
-| kitchen | 0.085 / 0.081 / 0.098 | 0.057 / 0.056 / 0.066 |
-| room | 0.082 / 0.082 / 0.103 | 0.061 / 0.051 / 0.066 |
-| stump | 0.127 / 0.126 / 0.142 | 0.042 / 0.039 / 0.046 |
-| treehill | 0.619 / 0.642 / 0.652 | 0.108 / 0.107 / 0.135 |
+| Scene | Position NRMSE (%) | Median rotation error (°) | AUC@3° (%) |
+| --- | --- | --- | --- |
+| bicycle | 0.157 / 0.178 / 0.197 | 0.026 / 0.026 / 0.035 | 97.13 / 96.89 / 96.36 |
+| bonsai | 0.155 / 0.155 / 0.164 | 0.119 / 0.117 / 0.126 | 95.38 / 95.45 / 95.28 |
+| counter | 0.030 / 0.027 / 0.079 | 0.031 / 0.029 / 0.039 | 98.39 / 98.50 / 97.90 |
+| flowers | 0.226 / 0.227 / 0.231 | 0.098 / 0.094 / 0.086 | 93.79 / 93.95 / 94.15 |
+| garden | 0.036 / 0.037 / 0.043 | 0.028 / 0.027 / 0.034 | 98.81 / 98.83 / 98.52 |
+| kitchen | 0.085 / 0.081 / 0.098 | 0.057 / 0.056 / 0.066 | 97.20 / 97.31 / 96.98 |
+| room | 0.082 / 0.082 / 0.103 | 0.061 / 0.051 / 0.066 | 96.72 / 96.87 / 96.14 |
+| stump | 0.127 / 0.126 / 0.142 | 0.042 / 0.039 / 0.046 | 97.09 / 97.14 / 96.75 |
+| treehill | 0.619 / 0.642 / 0.652 | 0.108 / 0.107 / 0.135 | 91.51 / 91.37 / 89.70 |
 
+Scene means — **AUC@3°: 96.22 / 96.25 / 95.75%**, in the same method order.
 
 Caspar logs contain 81 solves: 34 reached the limit of 200 outer iterations, and 47 stopped at the damping limit. PCG allows at most 20 iterations per outer iteration, with initial damping 1.0; these defaults were retained. These exits do not establish convergence to a common accuracy target. Caspar has a higher median reprojection error than Ceres in every scene and slightly larger deviations from the reference poses:
 
