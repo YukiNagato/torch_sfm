@@ -84,7 +84,7 @@ class Frame(FrameIndexedData):
     )
     # Per-image matcher input, never packed/sliced by keypoint index.
     dense_features: torch.Tensor | None = None
-    cam_idx: int | None = None
+    cam_idx: str | None = None
     mask_path: Path | None = None
     depth_path: Path | None = None
 

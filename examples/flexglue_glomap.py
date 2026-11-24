@@ -5,7 +5,7 @@ Install optional frontends (the tested revisions):
   pip install 'git+https://github.com/cvg/FlexGlue.git@c6cbc7a933bb70ab58608e8835d99b6cc4adca1a'
 
 Workspace contains dataset.json with an ordered image list and camera definitions.
-PINHOLE params are [fx, fy, cx, cy]. Images sharing cam_idx use the same camera.
+PINHOLE params are [fx, fy, cx, cy]. Images sharing a string cam_idx use the same camera.
 Run: python examples/flexglue_glomap.py /path/to/workspace
 
 Optional FP8 matcher (the descriptor still uses the original float weights):

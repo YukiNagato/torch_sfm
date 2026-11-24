@@ -162,7 +162,7 @@ class GlomapResult:
     intrinsics: torch.Tensor | None = None
     reprojection_errors: torch.Tensor | None = None
     bundle_adjustment_stats: dict = field(default_factory=dict)
-    camera_indices: tuple[int, ...] | None = None  # input cam_idx in image order
+    camera_indices: tuple[str, ...] | None = None  # input cam_idx in image order
     
     
 class GlomapPipeline:

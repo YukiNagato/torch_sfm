@@ -17,7 +17,7 @@ class InputCamera:
 @dataclass(frozen=True)
 class InputImage:
     image_path: Path
-    cam_idx: int
+    cam_idx: str
     mask_path: Path | None = None
     depth_path: Path | None = None
 
@@ -25,7 +25,7 @@ class InputImage:
 @dataclass(frozen=True)
 class DatasetManifest:
     images: tuple[InputImage, ...]
-    cameras: dict[int, InputCamera]
+    cameras: dict[str, InputCamera]
 
     @classmethod
     def read(cls, path: Path) -> 'DatasetManifest':
@@ -38,8 +38,8 @@ class DatasetManifest:
 
         cameras = {}
         for key, entry in data['cameras'].items():
-            if not key.isascii() or not key.isdecimal() or str(int(key)) != key:
-                raise ValueError(f'Invalid camera ID {key!r}. Use a nonnegative integer key.')
+            if not key.strip():
+                raise ValueError('Camera IDs must be nonempty strings')
             if not isinstance(entry, dict) or entry.get('model') != 'PINHOLE':
                 raise ValueError(f'Camera {key} must use the PINHOLE model')
             width, height = entry.get('width'), entry.get('height')
@@ -54,7 +54,7 @@ class DatasetManifest:
                         or min(params[:2]) <= 0):
                     raise ValueError(f'Camera {key} needs finite [fx, fy, cx, cy] with positive focal lengths')
                 params = tuple(map(float, params))
-            cameras[int(key)] = InputCamera(entry['model'], width, height, params)
+            cameras[key] = InputCamera(entry['model'], width, height, params)
 
         def resolve(value, field, index):
             if not isinstance(value, str) or not value.strip():
@@ -69,7 +69,9 @@ class DatasetManifest:
             if not isinstance(entry, dict):
                 raise ValueError(f'Image {index} must be an object')
             cam_idx = entry.get('cam_idx')
-            if type(cam_idx) is not int or cam_idx not in cameras:
+            if not isinstance(cam_idx, str):
+                raise ValueError(f'Image {index} cam_idx must be a string')
+            if cam_idx not in cameras:
                 raise ValueError(f'Image {index} references an unknown cam_idx: {cam_idx!r}')
             image_path = resolve(entry.get('image_path'), 'image_path', index)
             optional = {field: resolve(entry[field], field, index)
