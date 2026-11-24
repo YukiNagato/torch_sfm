@@ -263,10 +263,17 @@ def global_bundle_adjustment(
             stats['retriangulation'] = dict(resumed=True, points_after=len(points),
                                             observations_after=len(observations))
         else:
-            added = triangulator.triangulate()
-            changed = triangulator.complete_and_merge()
-            retriangulated = triangulator.retriangulate()
-            points, observations = triangulator.export()
+            with tqdm(total=2, desc="Triangulation", unit="step") as progress:
+                progress.set_postfix_str("Triangulate images")
+                added = triangulator.triangulate(progress=progress)
+                progress.set_postfix_str("Complete and merge tracks")
+                changed = triangulator.complete_and_merge()
+                progress.update(1)
+                progress.set_postfix_str("Retriangulate")
+                retriangulated = triangulator.retriangulate()
+                points, observations = triangulator.export()
+                progress.set_postfix_str("Complete", refresh=False)
+                progress.update(1)
             stats["retriangulation"] = {
                 "points_before": old_points,
                 "points_after": len(points),

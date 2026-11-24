@@ -273,15 +273,9 @@ class SpeculativeTriangulator(IncrementalTriangulator):
                 break
         return count
 
-    def triangulate(self, frame_indices=None):
+    def triangulate(self, frame_indices=None, *, progress=None):
         added = 0
-        images = self.valid_cameras if frame_indices is None else self.valid_cameras.intersection(frame_indices)
-        order = [
-            n for i in sorted(images) for n in self.by_image.get(i, [])
-        ]
-        size = self.config.batch_lookahead
-        for start in range(0, len(order), size):
-            window = order[start : start + size]
+        for window in self._triangulation_windows(frame_indices, self.config.batch_lookahead, progress):
             self._errors.clear()
             self._prepare_completion(
                 self.assignment[n] for n in window if self.assignment[n] != -1

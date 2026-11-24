@@ -526,7 +526,7 @@ class TensorTriangulator:
         s.assign(ids, selected[accepted])
         return len(ids)
 
-    def triangulate(self, frame_indices=None):
+    def triangulate(self, frame_indices=None, *, progress=None):
         """Process each image once; Create bounds its geometry work internally."""
         s = self.storage
         added = 0
@@ -534,17 +534,21 @@ class TensorTriangulator:
         if frame_indices is not None:
             requested = set(frame_indices)
             images = [image for image in images if image in requested]
+        if progress is not None:
+            progress.total += len(images)
+            progress.refresh()
         for image in images:
             lo, hi = s.frame_offsets[image : image + 2]
             ids = torch.arange(lo, hi, device=s.xy.device)
             ids = ids[(self.degree[ids] > 0) & s.obs_valid[ids]]
-            if not len(ids):
-                continue
-            neighbors = self.local_neighbors.padded(ids)
-            added += self._continue(
-                ids, neighbors, self.config.continue_max_angle_error
-            )
-            added += self._create(torch.cat((neighbors, ids[:, None]), -1))
+            if len(ids):
+                neighbors = self.local_neighbors.padded(ids)
+                added += self._continue(
+                    ids, neighbors, self.config.continue_max_angle_error
+                )
+                added += self._create(torch.cat((neighbors, ids[:, None]), -1))
+            if progress is not None:
+                progress.update(1)
         s.rebuild_tracks()
         return added
 

@@ -32,8 +32,9 @@ not match COLMAP's hash-container traversal or C++ sampler bit for bit.
 """
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass
-from itertools import combinations, islice
+from itertools import accumulate, combinations, islice
 
 import torch
 import torch.nn.functional as F
@@ -492,17 +493,31 @@ class IncrementalTriangulator:
                 break
         return count
 
-    def triangulate(self, frame_indices=None):
-        added = 0
+    def _triangulation_windows(self, frame_indices, batch_size, progress):
+        """Keep the observation traversal while reporting completed images."""
         images = self.valid_cameras if frame_indices is None else self.valid_cameras.intersection(frame_indices)
-        order = [
-            n
-            for image in sorted(images)
-            for n in self.by_image.get(image, [])
-        ]
-        size = self.config.batch_lookahead if self.candidate_cache else len(order) or 1
+        groups = [self.by_image.get(image, ()) for image in sorted(images)]
+        order = [node for group in groups for node in group]
+        size = batch_size or len(order) or 1
+        if progress is not None:
+            image_ends = list(accumulate(map(len, groups)))
+            completed = bisect_right(image_ends, 0)
+            progress.total += len(images)
+            progress.update(completed)
+            progress.refresh()
         for start in range(0, len(order), size):
             window = order[start : start + size]
+            yield window
+            if progress is not None:
+                finished = bisect_right(image_ends, start + len(window), lo=completed)
+                if finished > completed:
+                    progress.update(finished - completed)
+                    completed = finished
+
+    def triangulate(self, frame_indices=None, *, progress=None):
+        added = 0
+        size = self.config.batch_lookahead if self.candidate_cache or progress is not None else None
+        for window in self._triangulation_windows(frame_indices, size, progress):
             local = {}
             if self.candidate_cache:
                 tracks = []
