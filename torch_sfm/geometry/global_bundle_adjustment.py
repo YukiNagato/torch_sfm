@@ -6,6 +6,7 @@ from dataclasses import asdict
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from .bundle_adjustment import (
     BundleAdjustmentResult,
@@ -308,72 +309,86 @@ def global_bundle_adjustment(
             pending_recovery = None
             return added
 
-        for i in range(cfg.retriangulation_max_refinements):
-            # IncrementalMapper removes negative depth before each global BA.
-            filter_stage(f"refine_{i + 1}_depth", math.inf, "pixel")
-            old_obs = len(observations)
-            solve_stage(f"refine_{i + 1}_joint", cfg.retriangulation_max_iterations)
+        max_refinements = cfg.retriangulation_max_refinements
+        with tqdm(total=max_refinements + 1, desc="BA refinement", unit="stage") as progress:
+            for i in range(max_refinements):
+                current_round = f"Round {i + 1}/{max_refinements}"
+                progress.set_postfix_str(f"{current_round} · BA")
+                # IncrementalMapper removes negative depth before each global BA.
+                filter_stage(f"refine_{i + 1}_depth", math.inf, "pixel")
+                old_obs = len(observations)
+                solve_stage(f"refine_{i + 1}_joint", cfg.retriangulation_max_iterations)
+                normalize()
+                progress.set_postfix_str(f"{current_round} · Complete and filter tracks")
+                triangulator.load(points, observations)
+                triangulator.update_geometry(
+                    rotations, centers, intrinsics, registered=registered)
+                # PnP inliers entered the BA above. Triangulate the recovered views
+                # with their refined poses and share this round's completion/merge.
+                recovery_added = integrate_recovered(f"refine_{i + 1}", shared_completion=True)
+                changed = triangulator.complete_and_merge()
+                points, observations = triangulator.export()
+                removed = filter_stage(
+                    f"refine_{i + 1}",
+                    cfg.refinement_max_reprojection_error,
+                    "pixel",
+                    cfg.refinement_min_tri_angle,
+                )
+                ratio = (changed["completed"] + changed["merged"] + removed + recovery_added) / max(
+                    old_obs, 1
+                )
+                stats["refinements"].append(
+                    {
+                        "iteration": i + 1,
+                        **changed,
+                        "filtered": removed,
+                        "recovery_triangulated": recovery_added,
+                        "change_ratio": ratio,
+                    }
+                )
+                recovered = []
+                if (cfg.camera_recovery.enabled and i < cfg.camera_recovery.max_rounds
+                        and not bool(registered.all())):
+                    progress.set_postfix_str(f"{current_round} · Recover cameras")
+                    if points.is_cuda:
+                        torch.cuda.synchronize(points.device)
+                    start = time.perf_counter()
+                    observations, recovery = recover_cameras(
+                        frames, geometries, rotations, centers, points, observations,
+                        intrinsics, registered, cfg.camera_recovery)
+                    recovered = recovery["recovered"]
+                    if points.is_cuda:
+                        torch.cuda.synchronize(points.device)
+                    elapsed = time.perf_counter() - start
+                    recovery.update(after_refinement=i + 1, pnp_seconds=elapsed, seconds=elapsed)
+                    stats["camera_recovery"].append(recovery)
+                    if recovered:
+                        pending_recovery = recovery
+                converged = ratio < cfg.retriangulation_min_change and not recovered
+                if converged:
+                    progress.total = i + 2  # Completed rounds plus final joint BA.
+                progress.update(1)
+                if converged:
+                    break
+
+            progress.set_postfix_str("Final joint BA")
+            if pending_recovery is not None:
+                # A recovery at the iteration cap has no later refinement round.
+                # Complete its tracks before the existing final joint BA instead.
+                integrate_recovered("retriangulation_final", shared_completion=False)
+                points, observations = triangulator.export()
+            filter_stage(
+                "retriangulation_final_before_ba", cfg.max_normalized_reprojection_error
+            )
+            solve_stage("retriangulation_final_joint", cfg.max_iterations)
             normalize()
-            triangulator.load(points, observations)
-            triangulator.update_geometry(
-                rotations, centers, intrinsics, registered=registered)
-            # PnP inliers entered the BA above. Triangulate the recovered views
-            # with their refined poses and share this round's completion/merge.
-            recovery_added = integrate_recovered(f"refine_{i + 1}", shared_completion=True)
-            changed = triangulator.complete_and_merge()
-            points, observations = triangulator.export()
-            removed = filter_stage(
-                f"refine_{i + 1}",
-                cfg.refinement_max_reprojection_error,
-                "pixel",
-                cfg.refinement_min_tri_angle,
+            filter_stage(
+                "retriangulation_final",
+                cfg.max_normalized_reprojection_error,
+                angle=cfg.min_tri_angle,
             )
-            ratio = (changed["completed"] + changed["merged"] + removed + recovery_added) / max(
-                old_obs, 1
-            )
-            stats["refinements"].append(
-                {
-                    "iteration": i + 1,
-                    **changed,
-                    "filtered": removed,
-                    "recovery_triangulated": recovery_added,
-                    "change_ratio": ratio,
-                }
-            )
-            recovered = []
-            if (cfg.camera_recovery.enabled and i < cfg.camera_recovery.max_rounds
-                    and not bool(registered.all())):
-                if points.is_cuda:
-                    torch.cuda.synchronize(points.device)
-                start = time.perf_counter()
-                observations, recovery = recover_cameras(
-                    frames, geometries, rotations, centers, points, observations,
-                    intrinsics, registered, cfg.camera_recovery)
-                recovered = recovery["recovered"]
-                if points.is_cuda:
-                    torch.cuda.synchronize(points.device)
-                elapsed = time.perf_counter() - start
-                recovery.update(after_refinement=i + 1, pnp_seconds=elapsed, seconds=elapsed)
-                stats["camera_recovery"].append(recovery)
-                if recovered:
-                    pending_recovery = recovery
-            if ratio < cfg.retriangulation_min_change and not recovered:
-                break
-        if pending_recovery is not None:
-            # A recovery at the iteration cap has no later refinement round.
-            # Complete its tracks before the existing final joint BA instead.
-            integrate_recovered("retriangulation_final", shared_completion=False)
-            points, observations = triangulator.export()
-        filter_stage(
-            "retriangulation_final_before_ba", cfg.max_normalized_reprojection_error
-        )
-        solve_stage("retriangulation_final_joint", cfg.max_iterations)
-        normalize()
-        filter_stage(
-            "retriangulation_final",
-            cfg.max_normalized_reprojection_error,
-            angle=cfg.min_tri_angle,
-        )
+            progress.set_postfix_str("Complete", refresh=False)
+            progress.update(1)
 
     # Acceptance must survive the final filtering, not just the initial PnP fit.
     newly_registered = registered & ~initially_registered
