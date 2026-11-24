@@ -86,7 +86,7 @@ class GluemapConfig:
 class GluemapPipeline:
     def __init__(self, cfg: GluemapConfig, workspace: Path):
         self.cfg, self.workspace = cfg, Path(workspace)
-        self.frontend = GlomapPipeline(GlomapConfig(
+        self.frontend = GlomapPipeline.from_legacy_workspace(GlomapConfig(
             correspondence_method='flexglue', flexglue=cfg.flexglue,
             retrieval_top_k=cfg.retrieval_top_k, cache_backend='filesystem',
             retrieval_sequences=cfg.retrieval_sequences,

@@ -7,6 +7,7 @@ import torch
 from PIL import Image as PILImage
 
 from .model import Camera, CameraModel, Image, Point3D, Reconstruction
+from ..core.storage import camera_group_indices
 from ..geometry.averaging import so3_log
 from ..geometry.two_view import camera_matrix
 
@@ -22,6 +23,14 @@ def relative_image_name(image_path: Path, image_root: Path | None = None):
     return image_path.name
 
 
+def colmap_camera_ids(frames, shared):
+    groups = camera_group_indices(frames)
+    if groups is not None:
+        representatives, indices = groups
+        return [representatives[index] + 1 for index in indices]
+    return [1] * len(frames) if shared else list(range(1, len(frames) + 1))
+
+
 @torch.no_grad()
 def export_colmap(frames, result, path: Path, image_root: Path | None = None):
     rotations = result.rotations.detach().cpu().double()
@@ -31,6 +40,7 @@ def export_colmap(frames, result, path: Path, image_root: Path | None = None):
     registered = result.registered.detach().cpu()
     matrices = camera_matrix(result.intrinsics.detach().cpu().double())
     shared = matrices.ndim == 2
+    camera_ids = colmap_camera_ids(frames, shared)
     recon = Reconstruction()
     rgb_sum = torch.zeros((len(points), 3))
     counts = torch.bincount(observations[:, 0], minlength=len(points))
@@ -55,12 +65,14 @@ def export_colmap(frames, result, path: Path, image_root: Path | None = None):
                 image = torch.frombuffer(bytearray(source.tobytes()), dtype=torch.uint8)
                 image = image.reshape(height, width, 3).permute(2, 0, 1)
         matrix = matrices if shared else matrices[frame_index]
-        camera_id = 1 if shared else frame_index + 1
+        camera_id = camera_ids[frame_index]
         params = torch.stack((matrix[0, 0], matrix[1, 1], matrix[0, 2], matrix[1, 2]))
         if camera_id in recon.cameras:
             camera = recon.cameras[camera_id]
             if (camera.width, camera.height) != (width, height):
                 raise ValueError('Images sharing intrinsics must have the same resolution')
+            if not (camera.params == params.numpy()).all():
+                raise ValueError('Images sharing a camera must have the same intrinsic parameters')
         else:
             recon.cameras[camera_id] = Camera(camera_id, CameraModel.PINHOLE, width, height, params.numpy())
         frame_path = Path(frame.frame_path) if frame.frame_path is not None else Path(f'{frame_index}.png')

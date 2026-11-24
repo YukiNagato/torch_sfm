@@ -31,7 +31,7 @@
 """Pinhole view-graph focal calibration in Torch, following Fetzer/COLMAP.
 
 Only the principal point is treated as known. A shared input K represents one
-camera; an array of K represents independent cameras. No COLMAP runtime calls.
+camera. An array of K may carry camera groups or represent independent cameras.
 The pipeline uses shared-focal six-point initialization for shared K and
 seven-point F initialization for independent cameras.
 """
@@ -169,7 +169,7 @@ def _independent(log_f0, log_f1, coefficients):
 
 @torch.inference_mode(False)
 @torch.no_grad()
-def calibrate_view_graph(geometries, intrinsics, num_images, cfg=None):
+def calibrate_view_graph(geometries, intrinsics, num_images, cfg=None, *, camera_groups=None):
     """Return updated K, surviving pairs and diagnostics; fail on unobservable K.
 
     Inputs must contain independently estimated F (not K^-T E K^-1). Planar
@@ -185,7 +185,14 @@ def calibrate_view_graph(geometries, intrinsics, num_images, cfg=None):
         raise ValueError('Expected shared K or one K per image')
     if cfg.mode == 'trusted':
         return intrinsics.clone(), set(geometries), {'mode': 'trusted', 'optimized': False}
-    bank = matrices[None] if shared else matrices
+    if shared:
+        bank = matrices[None]
+    elif camera_groups is None:
+        bank = matrices
+    else:
+        representatives, frame_groups = camera_groups
+        bank = matrices[torch.as_tensor(representatives, device=matrices.device)]
+        frame_groups = torch.as_tensor(frame_groups, device=matrices.device)
     initial = (bank[:, 0, 0] + bank[:, 1, 1])/2
     pairs = [pair for pair, g in geometries.items()
              if g.config in ('UNCALIBRATED', 'CALIBRATED') and g.F is not None
@@ -197,6 +204,13 @@ def calibrate_view_graph(geometries, intrinsics, num_images, cfg=None):
     if (indices < 0).any() or (indices >= num_images).any():
         raise ValueError('View-graph image index out of range')
     camera_ids = torch.zeros_like(indices) if shared else indices
+    if not shared and camera_groups is not None:
+        camera_ids = frame_groups[indices]
+
+    def camera_support(ids):
+        distinct = ids[:, 0] != ids[:, 1]
+        return (torch.bincount(ids[:, 0], minlength=len(bank))
+                + torch.bincount(ids[distinct, 1], minlength=len(bank)))
     f = torch.stack([geometries[pair].F.to(device=device, dtype=torch.float64) for pair in pairs])
     coefficients = fetzer_coefficients(f, bank[camera_ids[:, 0], :2, 2], bank[camera_ids[:, 1], :2, 2])
     f0, f1 = initial[camera_ids[:, 0]], initial[camera_ids[:, 1]]
@@ -211,9 +225,7 @@ def calibrate_view_graph(geometries, intrinsics, num_images, cfg=None):
     usable &= coefficients.abs().amax(dim=(-2, -1)) > 1e-12
     pairs = [pair for pair, keep in zip(pairs, usable.cpu().tolist()) if keep]
     coefficients, camera_ids = coefficients[usable], camera_ids[usable]
-    counts = torch.bincount(camera_ids.flatten(), minlength=len(bank))
-    if shared:
-        counts //= 2
+    counts = camera_support(camera_ids)
     if (counts < cfg.min_pairs).any():
         raise ValueError('Insufficient informative pairs for one or more cameras; focal calibration is unobservable')
     # This changes execution placement only. Keep the same bounded torchls LM
@@ -248,15 +260,16 @@ def calibrate_view_graph(geometries, intrinsics, num_images, cfg=None):
         raise ValueError('Focal calibration failed or reached its bounds; inspect the view graph')
     errors = fetzer_residual(focal[camera_ids[:, 0]], focal[camera_ids[:, 1]], coefficients).norm(dim=-1)
     good = torch.isfinite(errors) & (errors <= cfg.max_calibration_error)
-    support = torch.bincount(camera_ids[good].flatten(), minlength=len(bank))
-    if shared:
-        support //= 2
+    support = camera_support(camera_ids[good])
     if (support < cfg.min_pairs).any():
         raise ValueError('Insufficient consistent pairs after focal calibration')
     accepted = {pair for pair, keep in zip(pairs, good.cpu().tolist()) if keep}
     accepted.update(pair for pair, g in geometries.items() if g.config in ('PLANAR', 'PANORAMIC'))
     bank[:, 0, 0] = bank[:, 1, 1] = focal
-    result = bank[0] if shared else bank
+    if shared:
+        result = bank[0]
+    else:
+        result = bank if camera_groups is None else bank[frame_groups]
     if intrinsics.shape[-1:] == (4,):
         result = result[..., [0, 1, 0, 1], [0, 1, 2, 2]]
     stats = dict(mode='estimate', optimized=True, initial_focal=initial.cpu().tolist(),

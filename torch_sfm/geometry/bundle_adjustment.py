@@ -7,6 +7,7 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 import torchls as tls
+from ..core.storage import camera_group_indices
 
 from .averaging import _check_solution, build_tracks, largest_component
 from .two_view import camera_matrix, homogeneous
@@ -428,13 +429,38 @@ def _solve_ba(frames, rotations, centers, points, observations, intrinsics, cfg,
         rotation_mask[1:] = 1
     params = _pinhole_parameters(intrinsics)
     shared = params.ndim == 1
-    current_intrinsics = params[None].clone() if shared else params[nodes].clone()
+    groups = None if shared else camera_group_indices(frames)
+    intrinsic_nodes = nodes
+    if shared:
+        intrinsic_ids = torch.zeros_like(camera_ids)
+        current_intrinsics = params[None].clone()
+    elif groups is None:
+        intrinsic_ids = camera_ids
+        current_intrinsics = params[nodes].clone()
+    else:
+        representatives, frame_groups = (nodes.new_tensor(indices) for indices in groups)
+        active_groups, node_groups = frame_groups[nodes].unique(sorted=True, return_inverse=True)
+        intrinsic_nodes = representatives[active_groups]
+        intrinsic_ids = node_groups[camera_ids]
+        current_intrinsics = params[intrinsic_nodes].clone()
+
+    def restore_intrinsic_blocks(values):
+        if shared:
+            updated = values[0]
+        elif groups is None:
+            updated = params.clone()
+            updated[nodes] = values
+        else:
+            bank = params[representatives].clone()
+            bank[active_groups] = values
+            updated = bank[frame_groups]
+        return _restore_intrinsics(updated, intrinsics)
+
     current_intrinsics[:, :2] = current_intrinsics[:, :2].log()
     intrinsic_mask = torch.zeros_like(current_intrinsics)
     intrinsic_mask[:, :2] = float(cfg.refine_focal_length)
     intrinsic_mask[:, 2:] = float(cfg.refine_principal_point)
     intrinsic_values = torch.stack((current_intrinsics, intrinsic_mask), 1)
-    intrinsic_ids = torch.zeros_like(camera_ids) if shared else camera_ids
     batch_size = (tls.AutoBatchSize(memory_budget_bytes=int(cfg.jacobian_batch_memory_mb * 1024**2))
                   if cfg.jacobian_batch_size == 'auto' else cfg.jacobian_batch_size)
     pixels = _measurements(frames, observations, points)
@@ -452,13 +478,8 @@ def _solve_ba(frames, rotations, centers, points, observations, intrinsics, cfg,
         updated_p[optimized_point_ids] = solved_p
         solved_k = solved_k.clone()
         solved_k[:, :2] = solved_k[:, :2].exp()
-        if shared:
-            updated_k = solved_k[0]
-        else:
-            updated_k = params.clone()
-            updated_k[nodes] = solved_k
         _check_solution(summary, 'BAE bundle adjustment')
-        return updated_r, updated_c, updated_p, _restore_intrinsics(updated_k, intrinsics), summary
+        return updated_r, updated_c, updated_p, restore_intrinsic_blocks(solved_k), summary
     grouped = cfg.fixed_camera_handling == 'grouped'
     if grouped:
         problem, _, active_camera_ids = _grouped_camera_problem(
@@ -487,8 +508,8 @@ def _solve_ba(frames, rotations, centers, points, observations, intrinsics, cfg,
     if cfg.refine_principal_point and cfg.principal_point_prior_sigma is not None:
         reference = intrinsics if principal_point_reference is None else principal_point_reference.to(intrinsics)
         reference = _pinhole_parameters(reference)
-        reference = reference[None, 2:] if shared else reference[nodes, 2:]
-        sigma = _principal_point_sigma(frames, nodes, intrinsics, cfg.principal_point_prior_sigma)
+        reference = reference[None, 2:] if shared else reference[intrinsic_nodes, 2:]
+        sigma = _principal_point_sigma(frames, intrinsic_nodes, intrinsics, cfg.principal_point_prior_sigma)
         # One Gaussian prior per intrinsic block, independent of observation count.
         problem.add_residual(_principal_point_prior,
             ('intrinsics', torch.arange(len(current_intrinsics), device=points.device)), reference, sigma)
@@ -533,12 +554,7 @@ def _solve_ba(frames, rotations, centers, points, observations, intrinsics, cfg,
                           if bool(intrinsic_mask.bool().any()) or not grouped
                           else current_intrinsics.clone())
     updated_parameters[:, :2] = updated_parameters[:, :2].exp()
-    if shared:
-        output_parameters = updated_parameters[0]
-    else:
-        output_parameters = params.clone()
-        output_parameters[nodes] = updated_parameters
-    output_intrinsics = _restore_intrinsics(output_parameters, intrinsics)
+    output_intrinsics = restore_intrinsic_blocks(updated_parameters)
     updated_points = original_points.clone()
     updated_points[optimized_point_ids] = solved['points']
     return updated_rotations, updated_centers, updated_points, output_intrinsics, summary

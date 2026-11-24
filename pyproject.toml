@@ -36,6 +36,9 @@ flexglue = [
     "raco @ git+https://github.com/cvg/RaCo.git@ee06fa68dbb20303f334fbc257dad71d4149603b",
     "flexglue @ git+https://github.com/cvg/FlexGlue.git@c6cbc7a933bb70ab58608e8835d99b6cc4adca1a",
 ]
+flexglue-fp8 = [
+    "flexglue-quantize @ git+https://github.com/YukiNagato/flexglue_quantize.git@24422eceaadb243e9051271dd37fbcd7ffffc301",
+]
 anycalib = [
     "anycalib @ git+https://github.com/javrtg/AnyCalib.git@027a8497d893f4b2596f23d6324c05e4b81064ed",
 ]

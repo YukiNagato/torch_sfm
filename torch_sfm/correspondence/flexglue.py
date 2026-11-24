@@ -1,10 +1,12 @@
 """RaCo detections and cached FlexGlue dense features, with fixed observation IDs."""
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 import torch
 
 from .base import Extractor, Matcher, Matches
+from .matching_schedule import belady_evictions, tile_pair_order
 
 
 @dataclass
@@ -20,8 +22,17 @@ class FlexGlueConfig:
     gpu_cache_images: int = 32
     weights: str | None = None  # None selects the official versioned URL
     detector_weights: str | None = None
+    backend: Literal['float', 'fp8'] = 'float'
+    quantized_weights: str | None = None  # None selects the default FP8 release
+    matching_schedule: Literal['original', 'tiled_belady'] = 'original'
 
     def __post_init__(self):
+        if self.backend not in ('float', 'fp8'):
+            raise ValueError('FlexGlue backend must be float or fp8')
+        if self.backend == 'float' and self.quantized_weights is not None:
+            raise ValueError('Set backend=fp8 when supplying quantized_weights')
+        if self.quantized_weights == '':
+            raise ValueError('quantized_weights must be a nonempty checkpoint path or None')
         if self.max_keypoints < 1 or self.detection_resize < 32:
             raise ValueError('Positive keypoint count and detection_resize >= 32 required')
         if self.feature_resize < 32 or self.feature_resize % 32:
@@ -33,6 +44,8 @@ class FlexGlueConfig:
             raise ValueError('Early stopping needs decay in [0,1) and positive covisibility')
         if self.gpu_cache_images < 2:
             raise ValueError('gpu_cache_images must retain at least two images')
+        if self.matching_schedule not in ('original', 'tiled_belady'):
+            raise ValueError('FlexGlue matching_schedule must be original or tiled_belady')
 
     def feature_options(self):
         return dict(version=1, detector='raco-v1.0.0', descriptor='flexglue-v0.1',
@@ -42,6 +55,12 @@ class FlexGlueConfig:
     def matching_options(self):
         options = asdict(self)
         options.pop('gpu_cache_images')
+        options.pop('matching_schedule')
+        # Preserve existing float cache identities; both backends reuse the
+        # same detector/descriptor features but never each other's matches.
+        if self.backend == 'float':
+            options.pop('backend')
+            options.pop('quantized_weights')
         return dict(version=1, **options)
 
 
@@ -85,6 +104,25 @@ class FlexGlueMatcher(Matcher):
         self.model = None
         self._images = OrderedDict()
 
+    def match_tiled(self, frames, pairs):
+        """Yield (i, j, matches) in tile order with future-aware feature eviction."""
+        if len(pairs) == 0:
+            return
+        capacity = self.config.gpu_cache_images
+        ordered = [pairs[index] for index in tile_pair_order(pairs, capacity)]
+        nonempty = [frame.keypoints_2d is not None and len(frame.keypoints_2d) > 0 for frame in frames]
+        active = [(i, j) for i, j in ordered if nonempty[i] and nonempty[j]]
+        evictions = belady_evictions(active, capacity)
+        self._images.clear()
+        try:
+            for i, j in ordered:
+                if nonempty[i] and nonempty[j]:
+                    for frame in next(evictions):
+                        self._images.pop(id(frames[frame]), None)
+                yield i, j, self.match(frames[i], frames[j])
+        finally:
+            self._images.clear()
+
     def _input(self, frame):
         # Keep the source object in the entry to protect against changed frame data.
         key = id(frame)
@@ -108,14 +146,27 @@ class FlexGlueMatcher(Matcher):
         if min(len(frame0.keypoints_2d), len(frame1.keypoints_2d)) == 0:
             return Matches(torch.empty((0, 2), dtype=torch.long), torch.empty(0))
         if self.model is None:
-            from flexglue import FlexGlue
-            kw = {} if self.config.weights is None else {'weights': self.config.weights}
+            if self.config.backend == 'fp8':
+                try:
+                    from flexglue_quantize import FlexGlue
+                except ModuleNotFoundError as error:
+                    if error.name != 'flexglue_quantize':
+                        raise
+                    raise ImportError('FP8 matching requires the flexglue-quantize package; '
+                                      'install the TorchSfM flexglue-fp8 extra') from error
+                kw = dict(weights=self.config.quantized_weights)
+            else:
+                from flexglue import FlexGlue
+                kw = {} if self.config.weights is None else {'weights': self.config.weights}
+                kw['n_layers'] = self.config.n_layers
             self.model = FlexGlue(describe=False, refine=False,
-                n_layers=self.config.n_layers, min_covisibility=self.config.min_covisibility,
+                min_covisibility=self.config.min_covisibility,
                 early_stop_decay=self.config.early_stop_decay,
                 filter_threshold=self.config.filter_threshold,
                 max_distance_px=self.config.max_distance_px, **kw).eval().to(self.device)
-        pred = self.model.match(self._input(frame0), self._input(frame1), sparse=True)
+        # A packed checkpoint retains all layers; truncate at inference time.
+        depth = {'n_layers': self.config.n_layers} if self.config.backend == 'fp8' else {}
+        pred = self.model.match(self._input(frame0), self._input(frame1), sparse=True, **depth)
         score = float(pred['covisibility_score'][0])
         rejected = score < self.config.min_covisibility
         matches = pred['matches0'][0]

@@ -13,7 +13,7 @@ from ..io import (
     TwoViewGeometry,
 )
 from ..io.database import MAX_IMAGE_ID, image_ids_to_pair_id
-from ..io.torch_model import relative_image_name
+from ..io.torch_model import colmap_camera_ids, relative_image_name
 from ..geometry.two_view import camera_matrix
 from ..geometry.averaging import so3_log
 
@@ -98,6 +98,7 @@ class ColmapCache(Cache):
         shared = matrices.ndim == 2
         if not shared and matrices.shape != (len(frames), 3, 3):
             raise ValueError('Provide shared intrinsics or one camera matrix per frame')
+        camera_ids = colmap_camera_ids(frames, shared)
         images, cameras = [], {}
         for index, frame in enumerate(frames):
             if frame.frame_idx != index:
@@ -109,12 +110,15 @@ class ColmapCache(Cache):
                     width, height = image.size
             path = Path(frame.frame_path) if frame.frame_path is not None else Path(f'{index}.png')
             name = relative_image_name(path, self.image_root)
-            camera_id = 1 if shared else index + 1
+            camera_id = camera_ids[index]
             matrix = matrices if shared else matrices[index]
             params = matrix[[0, 1, 0, 1], [0, 1, 2, 2]].numpy()
             camera = (width, height, params)
-            if camera_id in cameras and cameras[camera_id][:2] != camera[:2]:
-                raise ValueError('Images sharing intrinsics must have the same resolution')
+            if camera_id in cameras:
+                if cameras[camera_id][:2] != camera[:2]:
+                    raise ValueError('Images sharing intrinsics must have the same resolution')
+                if not np.array_equal(cameras[camera_id][2], params):
+                    raise ValueError('Images sharing a camera must have the same intrinsic parameters')
             cameras[camera_id] = camera
             images.append((index + 1, name, camera_id))
         names = [image[1] for image in images]
@@ -183,6 +187,8 @@ class ColmapCache(Cache):
                     result[name] = extra[name]
                 elif name + '_dtype' in extra:
                     result[name] = result[name].to(extra[name + '_dtype'])
+            if extra.get('feature_input') is not None:
+                result['feature_input'] = extra['feature_input']
             return result
         if kind == 'correspondences':
             try:
@@ -238,7 +244,7 @@ class ColmapCache(Cache):
                 feature_type = FeatureType.LOMA_B if features.shape[1] == 256 else FeatureType.LOMA_B128
                 self.db.keypoints[int(key) + 1] = xy.float().numpy()
                 self.db.descriptors[int(key) + 1] = Descriptors(features.float().numpy(), feature_type)
-                extra = {}
+                extra = {'feature_input': data.get('feature_input')}
                 for name, tensor in (('keypoints_2d', xy), ('features', features)):
                     extra[name + '_dtype'] = tensor.dtype
                     # COLMAP requires float32; keep double inputs losslessly for Torch callers.

@@ -5,35 +5,41 @@ from .filesystem import FileSystemCache
 from .colmap import ColmapCache
 
 
-def create_cache(backend, workspace, method='loma', database_path=None):
+def create_cache(backend, workspace, method='loma', database_path=None, *, image_root=None):
     workspace = Path(workspace)
     if backend == 'filesystem':
         return FileSystemCache(workspace / 'cache', method)
     if backend == 'colmap':
         path = Path(database_path) if database_path is not None else Path('database.db')
         return ColmapCache(path if path.is_absolute() else workspace / path,
-                           method, workspace / 'images')
+                           method, workspace / 'images' if image_root is None else image_root)
     raise ValueError(f'Unknown cache backend: {backend}')
 
 
-def copy_cache(source, target, frames, *, intrinsics=None, two_view_pairs=None):
+def copy_cache(source, target, frames, *, intrinsics=None, two_view_pairs=None,
+               keypoint_inputs=None, copy_retrieval=True):
     """Copy available stages only. Prepare the target with initial intrinsics first."""
     counts = dict(retrieval=0, keypoints=0, correspondences=0, two_view=0, two_view_uncalibrated=0)
     if intrinsics is not None:
         import torch
         from ..geometry.two_view import camera_matrix
         matrices = camera_matrix(intrinsics.detach().cpu().double())
-    pairs = source.load('retrieval')
+    pairs = source.load('retrieval') if copy_retrieval else None
+    compatible_frames = set()
     for frame in frames:
         data = source.load('keypoints', frame.frame_idx)
-        if data is not None:
+        if data is not None and (keypoint_inputs is None
+                                 or data.get('feature_input') == keypoint_inputs[frame.frame_idx]):
             target.save('keypoints', data, frame.frame_idx)
+            compatible_frames.add(frame.frame_idx)
             counts['keypoints'] += 1
     if pairs is not None:
         target.save('retrieval', pairs)
         counts['retrieval'] = len(pairs)
         for i, j in pairs:
             key = (frames[int(i)].frame_idx, frames[int(j)].frame_idx)
+            if keypoint_inputs is not None and not all(index in compatible_frames for index in key):
+                continue
             for kind in ('correspondences', 'two_view_uncalibrated', 'two_view'):
                 if kind == 'two_view' and two_view_pairs is not None and key not in two_view_pairs:
                     continue

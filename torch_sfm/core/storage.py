@@ -84,6 +84,9 @@ class Frame(FrameIndexedData):
     )
     # Per-image matcher input, never packed/sliced by keypoint index.
     dense_features: torch.Tensor | None = None
+    cam_idx: int | None = None
+    mask_path: Path | None = None
+    depth_path: Path | None = None
 
     @classmethod
     def from_storage(cls, storage: SFMStorage, frame_idx: int) -> "Frame":
@@ -107,6 +110,20 @@ class Frame(FrameIndexedData):
             kwargs["image_size"] = storage.image_sizes[frame_idx]
 
         return cls(**kwargs)
+
+
+def camera_group_indices(frames):
+    """Return the first frame in each camera group and the group index per frame."""
+    if not frames or getattr(frames[0], 'cam_idx', None) is None:
+        return None
+    group_ids, representatives, indices = {}, [], []
+    for index, frame in enumerate(frames):
+        cam_idx = frame.cam_idx
+        if cam_idx not in group_ids:
+            group_ids[cam_idx] = len(representatives)
+            representatives.append(index)
+        indices.append(group_ids[cam_idx])
+    return representatives, indices
 
 
 @dataclass(frozen=True)

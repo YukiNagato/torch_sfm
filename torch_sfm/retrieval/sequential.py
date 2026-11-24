@@ -7,7 +7,7 @@ import torch
 
 
 def load_sequence_ids(path, num_images):
-    """Read ordered start/end ranges aligned with images.txt (end exclusive)."""
+    """Read ordered start/end ranges aligned with the input image order (end exclusive)."""
     records = json.loads(Path(path).read_text())
     ids = np.full(num_images, -1, dtype=np.int64)
     for label, record in enumerate(records):

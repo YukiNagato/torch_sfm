@@ -1,10 +1,15 @@
+from contextlib import closing
 from dataclasses import dataclass, field, asdict, replace
 from torch_sfm.core import Frame, SFMStorage
+from torch_sfm.core.storage import camera_group_indices
+from torch_sfm.io.manifest import DatasetManifest
 from torch_sfm.utils import Timer
 from torch_sfm.cache import FileSystemCache, create_cache, copy_cache
+from io import BytesIO
 import numpy as np
 import hashlib
 import json
+import os
 import torch
 from pathlib import Path
 from torch_sfm.retrieval import get_retrieval, RetrievalResult
@@ -75,10 +80,30 @@ def _verification_batches(pending, config):
 
 def load_frame_image(frame: Frame):
     if frame.image is None:
-        image = np.array(Image.open(frame.frame_path))
+        with Image.open(frame.frame_path) as source:
+            image = np.array(source.convert('RGB'))
         image = torch.from_numpy(image).cuda().float().permute((2, 0, 1)) / 255
         return image
     return frame.image
+
+
+def _mask_keypoints(frame, mask_bytes):
+    with Image.open(BytesIO(mask_bytes)) as mask:
+        if mask.size[::-1] != frame.image_size:
+            raise ValueError(f'Mask {frame.mask_path} must match the image dimensions {frame.image_size[::-1]}')
+        if mask.mode not in ('1', 'L', 'I', 'F') and not mask.mode.startswith('I;16'):
+            mask = mask.convert('L')
+        valid = torch.from_numpy(np.array(mask) != 0).to(frame.keypoints_2d.device)
+    height, width = frame.image_size
+    xy = frame.keypoints_2d
+    x, y = xy.unbind(-1)
+    in_bounds = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    indices = in_bounds.nonzero().flatten()
+    px, py = xy[indices].long().unbind(-1)
+    keep = indices[valid[py, px]]
+    frame.keypoints_2d = xy[keep]
+    if frame.features is not None:
+        frame.features = frame.features[keep.to(frame.features.device)]
 
 
 @dataclass
@@ -88,7 +113,7 @@ class GlomapConfig:
     flexglue: FlexGlueConfig = field(default_factory=FlexGlueConfig)
     retrieval_top_k: int = 10
     retrieval_threshold: float = 0.5
-    retrieval_sequences: Path | None = None  # JSON start/end ranges aligned with images.txt
+    retrieval_sequences: Path | None = None  # JSON start/end ranges aligned with image order
     retrieval_sequential_neighbors: int = 30
 
     cache_frame_images: bool = True
@@ -137,26 +162,87 @@ class GlomapResult:
     intrinsics: torch.Tensor | None = None
     reprojection_errors: torch.Tensor | None = None
     bundle_adjustment_stats: dict = field(default_factory=dict)
+    camera_indices: tuple[int, ...] | None = None  # input cam_idx in image order
     
     
 class GlomapPipeline:
-    def __init__(self, cfg: GlomapConfig, workspace: Path):
+    @classmethod
+    def from_legacy_workspace(cls, cfg: GlomapConfig, workspace: Path):
+        """Retain the text-list frontend used by GlueMap and archived experiments."""
+        return cls(cfg, workspace, _legacy_input=True)
+
+    def __init__(self, cfg: GlomapConfig, workspace: Path, *, manifest: Path | None = None, _legacy_input=False):
         self.timer = timer
         self.cfg = cfg
-        self.workspace = workspace
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.image_root = self.workspace / 'images'
+        self.dataset = None
+        self._initial_intrinsics = None
+        if _legacy_input:
+            self.image_txt_path = self.workspace / 'images.txt'
+            self.intrinsic_path = self.workspace / 'intrinsics.txt'
+            self.image_list = [Path(line.strip()) for line in self.image_txt_path.read_text().splitlines()]
+        else:
+            path = Path(manifest) if manifest is not None else Path('dataset.json')
+            path = (self.workspace / path.expanduser()).resolve()
+            self.dataset = DatasetManifest.read(path)
+            self.image_list = [image.image_path for image in self.dataset.images]
+            if not all(p.is_relative_to(self.image_root.resolve()) for p in self.image_list):
+                self.image_root = Path(os.path.commonpath([p.parent for p in self.image_list]))
+        self.workspace.mkdir(parents=True, exist_ok=True)
         self.cache_root = self.workspace / 'cache'
-        self.cache = create_cache(cfg.cache_backend, self.workspace, cfg.correspondence_method, cfg.database_path)
+        self.cache = create_cache(cfg.cache_backend, self.workspace, cfg.correspondence_method, cfg.database_path,
+                                  image_root=self.image_root)
         self._cache_prepared = False
-        self.image_txt_path = self.workspace / 'images.txt'
-        self.intrinsic_path = self.workspace / 'intrinsics.txt'
-        with open(self.image_txt_path) as f:
-            self.image_list = [Path(line.strip()) for line in f.readlines()]
         self.frames = []
         self.extractor = None
         self.matcher = None
         self._frontend_options = None
         self.storage = None
         self.sequential_edges = set()
+
+    def _input_frames(self):
+        if self.dataset is None:
+            return [Frame(frame_idx=i, frame_path=p) for i, p in enumerate(self.image_list)]
+        frames = []
+        for idx, image in enumerate(self.dataset.images):
+            camera = self.dataset.cameras[image.cam_idx]
+            with Image.open(image.image_path) as source:
+                if source.size != (camera.width, camera.height):
+                    raise ValueError(f'Image {image.image_path} has size {source.size}, '
+                                     f'camera {image.cam_idx} expects {(camera.width, camera.height)}')
+            frames.append(Frame(frame_idx=idx, frame_path=image.image_path, cam_idx=image.cam_idx,
+                                mask_path=image.mask_path, depth_path=image.depth_path,
+                                image_size=(camera.height, camera.width)))
+        return frames
+
+    def _feature_input(self, frame):
+        if self.dataset is None:
+            return None, None
+        mask = frame.mask_path.read_bytes() if frame.mask_path is not None else None
+        return {'image_path': str(frame.frame_path),
+                'mask_sha256': hashlib.sha256(mask).hexdigest() if mask is not None else None}, mask
+
+    def _retrieval_stamp(self, cache):
+        path = (cache.path / 'retrieval_manifest.json' if isinstance(cache, FileSystemCache)
+                else cache.path.with_suffix(cache.path.suffix + '.retrieval_manifest.json'))
+        identity = {'images': [str(path) for path in self.image_list], 'method': self.cfg.retrieval_method,
+                    'top_k': self.cfg.retrieval_top_k}
+        return path, identity
+
+    def _retrieval_cache_matches(self, cache):
+        if self.dataset is None:
+            return True
+        path, identity = self._retrieval_stamp(cache)
+        return path.is_file() and json.loads(path.read_text()) == identity
+
+    def _save_retrieval_stamp(self, cache):
+        if self.dataset is not None:
+            path, identity = self._retrieval_stamp(cache)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(identity))
+            temporary.replace(path)
 
     def _prepare_frontend_config(self):
         """Do not reuse loaded networks after changing frontend settings."""
@@ -200,8 +286,7 @@ class GlomapPipeline:
     @timer
     def convert_cache(self, backend, database_path=None):
         """Copy cached stages without extracting/matching or changing this pipeline's backend."""
-        frames = self.frames or [Frame(frame_idx=i, frame_path=path)
-                                 for i, path in enumerate(self.image_list)]
+        frames = self.frames or self._input_frames()
         intrinsic = self.get_intrinsics()
         trusted = self.cfg.calibration.mode == 'trusted'
         export_pairs = None if trusted else set()
@@ -210,6 +295,7 @@ class GlomapPipeline:
             state = torch.load(state_path, map_location='cpu', weights_only=True)
             if (state.get('version') == 1 and _calibration_cache_options(state.get('config'))
                     == _calibration_cache_options(self.cfg.calibration)
+                    and state.get('camera_groups') == camera_group_indices(frames)
                     and torch.equal(state['input_intrinsics'], intrinsic.cpu())):
                 intrinsic = state['calibrated_intrinsics']
                 trusted = True
@@ -217,7 +303,8 @@ class GlomapPipeline:
                                 if state.get('verification_complete')
                                 and _geometry_cache_options(state.get('two_view_config'))
                                 == _geometry_cache_options(self.cfg.two_view) else set())
-        with create_cache(backend, self.workspace, self.cfg.correspondence_method, database_path) as target:
+        with create_cache(backend, self.workspace, self.cfg.correspondence_method, database_path,
+                          image_root=self.image_root) as target:
             if target.path.resolve() == self.cache.path.resolve():
                 raise ValueError('Source and target caches must be different')
             if self.cfg.cache_backend == 'colmap':
@@ -228,10 +315,36 @@ class GlomapPipeline:
                 target.prepare(frames, intrinsic, prior_focal_length=trusted)
             else:
                 target.prepare(frames, intrinsic)
-            return copy_cache(self.cache, target, frames, intrinsics=intrinsic, two_view_pairs=export_pairs)
+            keypoint_inputs = ([self._feature_input(frame)[0] for frame in frames]
+                               if self.dataset is not None else None)
+            retrieval_compatible = self._retrieval_cache_matches(self.cache)
+            counts = copy_cache(self.cache, target, frames, intrinsics=intrinsic, two_view_pairs=export_pairs,
+                                keypoint_inputs=keypoint_inputs, copy_retrieval=retrieval_compatible)
+            if self.dataset is not None and retrieval_compatible and self.cache.load('retrieval') is not None:
+                self._save_retrieval_stamp(target)
+            return counts
     
     @timer
     def get_intrinsics(self):
+        if self.dataset is not None:
+            if self._initial_intrinsics is None:
+                grouped = {}
+                for image in self.dataset.images:
+                    grouped.setdefault(image.cam_idx, []).append(image.image_path)
+                bank = {}
+                calibrator = None
+                for cam_idx, paths in grouped.items():
+                    camera = self.dataset.cameras[cam_idx]
+                    params = camera.params
+                    if params is None:
+                        from torch_sfm.calibration import AnyCalibCalibration
+                        if calibrator is None:
+                            calibrator = AnyCalibCalibration('pinhole')
+                        params = calibrator.estimate(paths[:10]).params
+                    bank[cam_idx] = torch.as_tensor(params, dtype=torch.float64)
+                self._initial_intrinsics = (next(iter(bank.values())) if len(bank) == 1 else
+                                            torch.stack([bank[image.cam_idx] for image in self.dataset.images]))
+            return self._initial_intrinsics.clone()
         if not self.intrinsic_path.exists():
             from torch_sfm.calibration import AnyCalibCalibration
             intrinsic = AnyCalibCalibration('pinhole').estimate(self.image_list[:10])
@@ -246,7 +359,8 @@ class GlomapPipeline:
         if self.cfg.retrieval_sequences is not None:
             return self._get_sequence_retrieval_pairs()
         cached = (self.cache.load('retrieval') if self.cfg.use_cache
-                  and not self.cfg.update_cache_for_retrieval else None)
+                  and not self.cfg.update_cache_for_retrieval
+                  and self._retrieval_cache_matches(self.cache) else None)
         if cached is not None:
             retrieval_pairs = cached
         else:
@@ -274,6 +388,7 @@ class GlomapPipeline:
             retrieval_pairs = np.array(retrieval_pairs, dtype=np.int32).reshape(-1, 2)
             if self.cfg.use_cache:
                 self.cache.save('retrieval', retrieval_pairs)
+                self._save_retrieval_stamp(self.cache)
 
         return retrieval_pairs
 
@@ -327,10 +442,14 @@ class GlomapPipeline:
         feature_options = (self.cfg.flexglue.feature_options()
                            if self.cfg.correspondence_method == 'flexglue' else None)
         for frame in tqdm(frames, desc='Extract keypoints'):
+            feature_input, mask = self._feature_input(frame)
             data = (self.cache.load('keypoints', frame.frame_idx) if self.cfg.use_cache
                     and not self.cfg.update_cache_for_keypoints else None)
-            if data is not None and feature_options is not None and data.get('options') != feature_options:
-                data = None
+            if data is not None:
+                if data.get('feature_input') != feature_input:
+                    data = None
+                elif feature_options is not None and data.get('options') != feature_options:
+                    data = None
             if data is not None:
                 device = frame.image.device if frame.image is not None else 'cpu'
                 frame.keypoints_2d = data['keypoints_2d'].to(device)
@@ -342,7 +461,10 @@ class GlomapPipeline:
                     self.extractor, self.matcher = get_extractor_and_matcher(self.cfg.correspondence_method, self.cfg.flexglue)
                 image = frame.image
                 frame.image = load_frame_image(frame)
+                frame.image_size = tuple(frame.image.shape[-2:])
                 self.extractor.extract(frame)
+                if mask is not None:
+                    _mask_keypoints(frame, mask)
                 if not self.cfg.cache_frame_images:
                     frame.image = image
                 if self.cfg.use_cache:
@@ -352,6 +474,7 @@ class GlomapPipeline:
                         'dense_features': frame.dense_features,
                         'image_size': frame.image_size,
                         'options': feature_options,
+                        'feature_input': feature_input,
                     }, frame.frame_idx)
                     if isinstance(self.cache, FileSystemCache) and frame.dense_features is not None:
                         # Newly extracted maps should use the same bounded-RAM
@@ -362,6 +485,15 @@ class GlomapPipeline:
             self.extractor.release()
         return frames
 
+    def _save_correspondence(self, key, matches, options):
+        if self.cfg.use_cache:
+            self.cache.save('correspondences', {
+                'indices': matches.indices,
+                'scores': matches.scores,
+                'metadata': matches.metadata,
+                'options': options,
+            }, key)
+
     @timer
     @torch.inference_mode()
     def get_correspondences(self, frames: List[Frame], retrieval_pairs: np.ndarray):
@@ -371,16 +503,27 @@ class GlomapPipeline:
 
         match_options = (self.cfg.flexglue.matching_options()
                          if self.cfg.correspondence_method == 'flexglue' else None)
+        tiled = (match_options is not None
+                 and self.cfg.flexglue.matching_schedule == 'tiled_belady')
+        read_cache = (self.cfg.use_cache and not self.cfg.update_cache_for_correspondence
+                      and not self.cfg.update_cache_for_keypoints)
+        pending = []
+        reverse_aliases = set()
         correspondences = {}
-        for i, j in tqdm(retrieval_pairs, desc='Match pairs'):
+        for i, j in tqdm(retrieval_pairs, desc='Plan matches' if tiled else 'Match pairs'):
             i, j = int(i), int(j)
+            if tiled and (i, j) in correspondences:
+                continue
             frame0, frame1 = frames[i], frames[j]
             key = (frame0.frame_idx, frame1.frame_idx)
-            data = (self.cache.load('correspondences', key) if self.cfg.use_cache
-                    and not self.cfg.update_cache_for_correspondence
-                    and not self.cfg.update_cache_for_keypoints else None)
-            if (data is None and self.cfg.correspondence_method == 'flexglue' and self.cfg.use_cache
-                    and not self.cfg.update_cache_for_correspondence and not self.cfg.update_cache_for_keypoints):
+            data = self.cache.load('correspondences', key) if read_cache else None
+            if data is None and match_options is not None and read_cache:
+                if tiled and (j, i) in correspondences and correspondences[j, i] is None:
+                    # In original order this pair would reuse the reverse
+                    # result as soon as its earlier job wrote the cache.
+                    reverse_aliases.add((i, j))
+                    correspondences[i, j] = None
+                    continue
                 reverse = self.cache.load('correspondences', key[::-1])
                 if reverse is not None:
                     data = dict(reverse, indices=reverse['indices'][:, [1, 0]])
@@ -388,6 +531,11 @@ class GlomapPipeline:
                 data = None
             if data is not None:
                 matches = Matches(data['indices'], data['scores'], data.get('metadata', {}))
+            elif tiled:
+                pending.append((i, j))
+                # Reserve the original dictionary position for downstream stages.
+                correspondences[i, j] = None
+                continue
             else:
                 if self.matcher is None:
                     self.extractor, self.matcher = get_extractor_and_matcher(self.cfg.correspondence_method, self.cfg.flexglue)
@@ -399,14 +547,20 @@ class GlomapPipeline:
                 matches = Matches(matches.indices.cpu(), matches.scores.cpu(), matches.metadata)
                 if not self.cfg.cache_frame_images:
                     frame0.image, frame1.image = image0, image1
-                if self.cfg.use_cache:
-                    self.cache.save('correspondences', {
-                        'indices': matches.indices,
-                        'scores': matches.scores,
-                        'metadata': matches.metadata,
-                        'options': match_options,
-                    }, key)
+                self._save_correspondence(key, matches, match_options)
             correspondences[i, j] = matches
+
+        if pending:
+            if self.matcher is None:
+                self.extractor, self.matcher = get_extractor_and_matcher(self.cfg.correspondence_method, self.cfg.flexglue)
+            with closing(self.matcher.match_tiled(frames, pending)) as scheduled:
+                for i, j, matches in tqdm(scheduled, total=len(pending), desc='Match pairs'):
+                    key = (frames[i].frame_idx, frames[j].frame_idx)
+                    self._save_correspondence(key, matches, match_options)
+                    correspondences[i, j] = matches
+                    if (j, i) in reverse_aliases:
+                        correspondences[j, i] = Matches(matches.indices[:, [1, 0]],
+                                                        matches.scores, matches.metadata)
 
         self.matching_stats = {
             'pairs': len(correspondences),
@@ -518,10 +672,12 @@ class GlomapPipeline:
                 uncalibrated_model='shared_focal' if shared_focal else 'fundamental'),
             cache_kind='two_view_uncalibrated')
         device = self.cfg.geometry_device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        import hashlib
+        camera_groups = camera_group_indices(frames)
         digest = hashlib.sha256(json.dumps(_calibration_cache_options(cfg), sort_keys=True).encode())
         digest.update(str((len(frames), tuple(intrinsic.shape))).encode())
         digest.update(intrinsic.detach().cpu().double().numpy().tobytes())
+        if camera_groups is not None:
+            digest.update(json.dumps(camera_groups).encode())
         ordered = sorted(first)
         digest.update(json.dumps([(p, first[p].config, first[p].F is not None) for p in ordered]).encode())
         fundamentals = [first[p].F for p in ordered if first[p].F is not None]
@@ -545,7 +701,8 @@ class GlomapPipeline:
                     batch_size=self.cfg.two_view.pair_batch_size, max_iterations=cfg.fundamental_refine_iterations,
                     intrinsics=intrinsic,model=cfg.fundamental_refine_model,
                     focal_ratio_bounds=(cfg.min_focal_ratio,cfg.max_focal_ratio))
-            updated, accepted, stats = calibrate_view_graph(calibration_geometry, intrinsic.to(device), len(frames), cfg)
+            updated, accepted, stats = calibrate_view_graph(calibration_geometry, intrinsic.to(device), len(frames), cfg,
+                                                            camera_groups=camera_groups)
             stats['cache_hit'] = False
         self._calibration_ready = True
         if self.cfg.use_cache:
@@ -559,7 +716,7 @@ class GlomapPipeline:
                         'verification_complete': verification_complete,
                         'two_view_config': _geometry_cache_options(self.cfg.two_view),
                         'input_intrinsics': intrinsic.cpu(), 'calibrated_intrinsics': updated.cpu(),
-                        'config': asdict(cfg), 'stats': stats}, temporary)
+                        'camera_groups': camera_groups, 'config': asdict(cfg), 'stats': stats}, temporary)
             temporary.replace(state_path)
         save_calibration()
         second_config = replace(self.cfg.two_view, calibration='calibrated',
@@ -624,18 +781,16 @@ class GlomapPipeline:
 
     @timer
     def load_frames(self):
-        self.frames = []
-        for idx, image_path in enumerate(tqdm(self.image_list)):
-            frame = Frame(frame_idx=idx, frame_path=image_path)
-            if self.cfg.cache_frame_images:
+        self.frames = self._input_frames()
+        if self.cfg.cache_frame_images:
+            for frame in tqdm(self.frames):
                 frame.image = load_frame_image(frame)
-            self.frames.append(frame)
 
     @timer
     def run(self):
         self._calibration_ready = False
-        intrinsic = self.get_intrinsics()
         self.load_frames()
+        intrinsic = self.get_intrinsics()
         self._prepare_cache(self.frames, intrinsic)
         retrieval_pairs = self.get_retrieval_pairs()
         self.get_keypoints(self.frames)
@@ -645,12 +800,14 @@ class GlomapPipeline:
         intrinsic, geometries = self.get_calibrated_view_graph(self.frames, correspondences, intrinsic)
         rotations = self.get_rotations(geometries)
         positions = self.get_positions(rotations.edges, rotations.rotations, intrinsic)
+        camera_indices = (tuple(frame.cam_idx for frame in self.frames) if self.dataset is not None else None)
         initial = {
             'rotations': rotations.rotations.cpu(), 'centers': positions.centers.cpu(),
             'translations': -(rotations.rotations @ positions.centers[..., None]).squeeze(-1).cpu(),
             'registered': positions.registered.cpu(), 'rotation_registered': rotations.registered.cpu(),
             'points3d': positions.points3d.cpu(), 'observations': positions.observations.cpu(),
             'intrinsics': intrinsic.cpu(), 'image_paths': [str(frame.frame_path) for frame in self.frames],
+            'camera_indices': camera_indices,
             'input_intrinsics': input_intrinsic.cpu(), 'calibration': self.calibration_stats,
             'positioning_method': positions.method, 'stage': 'global_positioning',
             'solver_summaries': [asdict(s) for s in rotations.summaries + positions.summaries],
@@ -662,7 +819,7 @@ class GlomapPipeline:
             refined.rotations, refined.centers, translations, refined.registered,
             rotations.registered, refined.points3d, refined.observations, geometries,
             positions.method, rotations.summaries + positions.summaries + refined.summaries,
-            refined.intrinsics, refined.reprojection_errors, refined.stats,
+            refined.intrinsics, refined.reprojection_errors, refined.stats, camera_indices,
         )
         torch.save({
             'rotations': self.result.rotations.cpu(),
@@ -676,6 +833,7 @@ class GlomapPipeline:
             'initial_intrinsics': intrinsic.cpu(),
             'input_intrinsics': input_intrinsic.cpu(), 'calibration': self.calibration_stats,
             'image_paths': [str(frame.frame_path) for frame in self.frames],
+            'camera_indices': self.result.camera_indices,
             'positioning_method': self.result.positioning_method,
             'solver_summaries': [asdict(summary) for summary in self.result.solver_summaries],
             'reprojection_errors': self.result.reprojection_errors.cpu(),
@@ -684,20 +842,21 @@ class GlomapPipeline:
         }, self.workspace / 'reconstruction.pt')
         if self.cfg.export_colmap:
             from torch_sfm.io.torch_model import export_colmap
-            export_colmap(self.frames, self.result, self.workspace / 'sparse' / '0', self.workspace / 'images')
+            export_colmap(self.frames, self.result, self.workspace / 'sparse' / '0', self.image_root)
         return self.result
 
 
-def main(workspace: Path, config: GlomapConfig, visualize: bool = True):
-    """Run reconstruction from images.txt and optional intrinsics.txt.
+def main(workspace: Path, config: GlomapConfig, visualize: bool = True, manifest: Path | None = None):
+    """Run reconstruction from a JSON dataset manifest.
 
     Args:
-        workspace: Input lists, stage caches and reconstruction output directory.
+        workspace: Dataset, stage caches and reconstruction output directory.
         config: Pipeline settings, including frontend, geometry and solver options.
         visualize: Write the reconstruction HTML visualization after solving.
+        manifest: Input manifest path, defaulting to dataset.json in the workspace.
     """
     timer.reset()
-    with GlomapPipeline(config, workspace.expanduser().resolve()) as pipeline:
+    with GlomapPipeline(config, workspace, manifest=manifest) as pipeline:
         result = pipeline.run()
         if visualize:
             pipeline.visualize()
