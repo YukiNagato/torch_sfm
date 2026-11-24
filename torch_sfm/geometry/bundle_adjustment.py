@@ -185,6 +185,8 @@ class _PoseVar(tls.Var,
 
 def _ba_cg_config(cfg, solver):
     cg = cfg.conjugate_gradient
+    if solver != 'conjugate_gradient' and cg.normal_matvec == 'warp':
+        cg = replace(cg, normal_matvec='torch')
     if solver not in ('conjugate_gradient', 'schur_cg'):
         return replace(cg, preconditioner_groups=())
     if cfg.pose_parameterization == 'split':

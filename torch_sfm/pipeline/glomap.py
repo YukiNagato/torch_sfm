@@ -17,7 +17,7 @@ from torch_sfm.correspondence import get_extractor_and_matcher, Matches, FlexGlu
 from torch_sfm.geometry import (
     TwoViewConfig, TwoViewGeometry, RotationConfig, PositionConfig,
     camera_matrix, verify_two_view_batch, rotation_averaging, translation_averaging,
-    BundleAdjustmentConfig, bundle_adjustment,
+    BundleAdjustmentConfig, TriangulationConfig, bundle_adjustment,
     ViewGraphCalibrationConfig, calibrate_view_graph,
 )
 from PIL import Image
@@ -106,11 +106,24 @@ def _mask_keypoints(frame, mask_bytes):
         frame.features = frame.features[keep.to(frame.features.device)]
 
 
+def _glomap_bundle_adjustment():
+    cfg = BundleAdjustmentConfig(
+        linear_solver='conjugate_gradient',
+        triangulation=TriangulationConfig(implementation='tensor'),
+    )
+    cfg.conjugate_gradient = replace(cfg.conjugate_gradient, backend='warp', normal_matvec='warp')
+    return cfg
+
+
+def _glomap_flexglue():
+    return FlexGlueConfig(matching_schedule='tiled_belady', early_stop_decay=0.5)
+
+
 @dataclass
 class GlomapConfig:
     retrieval_method: str = 'salad'
     correspondence_method: str = 'loma'
-    flexglue: FlexGlueConfig = field(default_factory=FlexGlueConfig)
+    flexglue: FlexGlueConfig = field(default_factory=_glomap_flexglue)
     retrieval_top_k: int = 10
     retrieval_threshold: float = 0.5
     retrieval_sequences: Path | None = None  # JSON start/end ranges aligned with image order
@@ -127,14 +140,14 @@ class GlomapConfig:
     geometry_device: str | None = None
     two_view: TwoViewConfig = field(default_factory=TwoViewConfig)
     rotation: RotationConfig = field(default_factory=RotationConfig)
-    position: PositionConfig = field(default_factory=PositionConfig)
-    bundle_adjustment: BundleAdjustmentConfig = field(default_factory=BundleAdjustmentConfig)
+    position: PositionConfig = field(default_factory=lambda: PositionConfig(track_strategy='colmap'))
+    bundle_adjustment: BundleAdjustmentConfig = field(default_factory=_glomap_bundle_adjustment)
     export_colmap: bool = True
     calibration: ViewGraphCalibrationConfig = field(default_factory=ViewGraphCalibrationConfig)
 
     def __post_init__(self):
         if isinstance(self.flexglue, dict):
-            self.flexglue = FlexGlueConfig(**self.flexglue)
+            self.flexglue = replace(_glomap_flexglue(), **self.flexglue)
         if not isinstance(self.flexglue, FlexGlueConfig):
             raise TypeError('flexglue must be FlexGlueConfig or a dictionary')
         if self.correspondence_method == 'flexglue' and self.cache_backend != 'filesystem':
@@ -766,9 +779,13 @@ class GlomapPipeline:
 
     @timer
     def get_bundle_adjustment(self, rotations, positions, intrinsic):
+        cfg = self.cfg.bundle_adjustment
+        cg = cfg.conjugate_gradient
+        if not positions.centers.is_cuda and (cg.backend == 'warp' or cg.normal_matvec == 'warp'):
+            cfg = replace(cfg, conjugate_gradient=replace(cg, backend='torch', normal_matvec='torch'))
         return bundle_adjustment(self.frames, rotations.rotations, positions.centers, positions.points3d,
             positions.observations, intrinsic, positions.registered,
-            self.cfg.bundle_adjustment, rotations.edges)
+            cfg, rotations.edges)
 
     @timer
     def visualize(self, output_path: Path | None = None, *, max_points=100000, camera_scale=None, view_up='auto'):

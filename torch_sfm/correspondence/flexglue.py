@@ -39,9 +39,10 @@ class FlexGlueConfig:
             raise ValueError('feature_resize must be a positive multiple of 32')
         if not 0 <= self.min_covisibility <= 1 or not 1 <= self.n_layers <= 9:
             raise ValueError('Require covisibility in [0,1] and 1..9 transformer layers')
-        if self.early_stop_decay is not None and (
-                not 0 <= self.early_stop_decay < 1 or self.min_covisibility == 0):
-            raise ValueError('Early stopping needs decay in [0,1) and positive covisibility')
+        if self.early_stop_decay is not None and not 0 <= self.early_stop_decay < 1:
+            raise ValueError('Early stopping needs decay in [0,1)')
+        if self.min_covisibility == 0:
+            self.early_stop_decay = None
         if self.gpu_cache_images < 2:
             raise ValueError('gpu_cache_images must retain at least two images')
         if self.matching_schedule not in ('original', 'tiled_belady'):
