@@ -128,15 +128,17 @@ class FlexGlueMatcher(Matcher):
         # Keep the source object in the entry to protect against changed frame data.
         key = id(frame)
         entry = self._images.pop(key, None)
-        if entry is None or entry[0] is not frame.dense_features:
-            if frame.dense_features is None or frame.image_size is None:
+        source = frame.dense_features
+        if entry is None or entry[0] is not source:
+            if source is None or frame.image_size is None:
                 raise ValueError('FlexGlue requires cached dense_features and image_size')
             height, width = frame.image_size
-            data = dict(features=frame.dense_features[None].to(self.device),
+            features = source() if callable(source) else source
+            data = dict(features=features[None].to(self.device),
                         keypoints=frame.keypoints_2d[None].to(self.device),
                         image_size=torch.tensor([[width, height]], device=self.device,
                                                 dtype=torch.float32))
-            entry = (frame.dense_features, data)
+            entry = (source, data)
         self._images[key] = entry
         while len(self._images) > self.config.gpu_cache_images:
             self._images.popitem(last=False)

@@ -15,6 +15,10 @@ class Cache(ABC):
     def load(self, kind, key=None):
         ...
 
+    def load_keypoints(self, key):
+        """Load matching inputs, possibly with a lazy dense feature map."""
+        return self.load('keypoints', key)
+
     @abstractmethod
     def save(self, kind, data, key=None):
         ...

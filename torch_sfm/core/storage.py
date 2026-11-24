@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
@@ -83,7 +84,7 @@ class Frame(FrameIndexedData):
         None  # original (height, width), without retaining pixels
     )
     # Per-image matcher input, never packed/sliced by keypoint index.
-    dense_features: torch.Tensor | None = None
+    dense_features: torch.Tensor | Callable[[], torch.Tensor] | None = None
     cam_idx: str | None = None
     mask_path: Path | None = None
     depth_path: Path | None = None

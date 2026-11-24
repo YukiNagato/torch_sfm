@@ -1,3 +1,4 @@
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 import math
@@ -46,7 +47,7 @@ class ColmapCache(Cache):
     def _key(self, kind, key):
         if kind in ('retrieval', 'metadata'):
             return ''
-        if kind == 'keypoints':
+        if kind in ('keypoints', 'dense_features'):
             return str(int(key))
         if kind in ('correspondences', 'two_view', 'two_view_uncalibrated'):
             return '_'.join(map(str, sorted(map(int, key))))
@@ -63,7 +64,7 @@ class ColmapCache(Cache):
         buffer = BytesIO()
         torch.save(data, buffer)
         image_id1 = image_id2 = None
-        if kind == 'keypoints':
+        if kind in ('keypoints', 'dense_features'):
             image_id1 = int(key) + 1
         elif kind in ('correspondences', 'two_view', 'two_view_uncalibrated'):
             image_id1, image_id2 = sorted(int(index) + 1 for index in key)
@@ -159,6 +160,57 @@ class ColmapCache(Cache):
                 self.db.connection.execute("DELETE FROM torch_sfm_cache WHERE kind='two_view'")
             self._write_extra('metadata', metadata)
 
+    def load_keypoints(self, key):
+        return self._load_keypoints(key, lazy_dense=True)
+
+    def _load_dense_features(self, key):
+        features = self._extra('dense_features', key)
+        if features is None:
+            raise KeyError(f'Missing FlexGlue dense features for frame {key}')
+        return features
+
+    def _load_keypoints(self, key, *, lazy_dense=False):
+        if not self.path.exists():
+            return None
+        image_id = int(key) + 1
+        try:
+            xy = self.db.keypoints[image_id][:, :2]
+        except KeyError:
+            return None
+        extra = self._extra('keypoints', key) or {}
+        if extra and extra.get('signature') != self._signature('keypoints', key):
+            return None
+        result = {'keypoints_2d': torch.from_numpy(xy)}
+        if self.method == 'flexglue':
+            if lazy_dense:
+                # Query the index without materializing the feature BLOB.
+                row = self.db.connection.execute(
+                    "SELECT 1 FROM torch_sfm_cache WHERE kind='dense_features' AND key=?",
+                    (self._key('dense_features', key),)).fetchone()
+                dense = None if row is None else partial(self._load_dense_features, key)
+            else:
+                dense = self._extra('dense_features', key)
+            if dense is None or extra.get('image_size') is None:
+                return None
+            result.update(dense_features=dense, features=None, image_size=extra['image_size'],
+                          options=extra.get('options'))
+        else:
+            try:
+                descriptors = self.db.descriptors[image_id]
+            except KeyError:
+                return None
+            if descriptors.type not in (FeatureType.LOMA_B, FeatureType.LOMA_B128):
+                return None
+            result['features'] = torch.from_numpy(descriptors.data)
+        for name in ('keypoints_2d', 'features'):
+            if extra.get(name) is not None:
+                result[name] = extra[name]
+            elif name + '_dtype' in extra:
+                result[name] = result[name].to(extra[name + '_dtype'])
+        if extra.get('feature_input') is not None:
+            result['feature_input'] = extra['feature_input']
+        return result
+
     def load(self, kind, key=None):
         if not self.path.exists():
             return None
@@ -171,25 +223,7 @@ class ColmapCache(Cache):
             pairs = self._extra(kind)
             return None if pairs is None else pairs.numpy()
         if kind == 'keypoints':
-            try:
-                xy = self.db.keypoints[int(key) + 1][:, :2]
-                descriptors = self.db.descriptors[int(key) + 1]
-            except KeyError:
-                return None
-            if descriptors.type not in (FeatureType.LOMA_B, FeatureType.LOMA_B128):
-                return None
-            extra = self._extra(kind, key) or {}
-            if extra and extra.get('signature') != self._signature(kind, key):
-                return None
-            result = {'keypoints_2d': torch.from_numpy(xy), 'features': torch.from_numpy(descriptors.data)}
-            for name in result:
-                if extra.get(name) is not None:
-                    result[name] = extra[name]
-                elif name + '_dtype' in extra:
-                    result[name] = result[name].to(extra[name + '_dtype'])
-            if extra.get('feature_input') is not None:
-                result['feature_input'] = extra['feature_input']
-            return result
+            return self._load_keypoints(key)
         if kind == 'correspondences':
             try:
                 indices = self.db.matches[tuple(int(index) + 1 for index in key)]
@@ -201,7 +235,12 @@ class ColmapCache(Cache):
             scores = torch.ones(len(indices)) if extra is None else extra['scores']
             if len(scores) != len(indices):
                 return None
-            return {'indices': torch.from_numpy(indices.astype(np.int64)), 'scores': scores}
+            result = {'indices': torch.from_numpy(indices.astype(np.int64)), 'scores': scores}
+            if extra is not None:
+                for name in ('metadata', 'options'):
+                    if name in extra:
+                        result[name] = extra[name]
+            return result
         if kind == 'two_view':
             extra = self._extra(kind, key)
             if extra is None or extra['direction'] != tuple(map(int, key)):
@@ -236,26 +275,41 @@ class ColmapCache(Cache):
             if kind == 'retrieval':
                 self._write_extra(kind, torch.as_tensor(data, dtype=torch.int32).cpu())
             elif kind == 'keypoints':
-                xy, features = data['keypoints_2d'].detach().cpu(), data['features'].detach().cpu()
-                if len(xy) != len(features):
-                    raise ValueError('Keypoints and descriptors must have the same number of rows')
-                if self.method != 'loma' or features.ndim != 2 or features.shape[1] not in (128, 256):
-                    raise ValueError('COLMAP cache currently supports LoMa 128/256-dimensional descriptors')
-                feature_type = FeatureType.LOMA_B if features.shape[1] == 256 else FeatureType.LOMA_B128
-                self.db.keypoints[int(key) + 1] = xy.float().numpy()
-                self.db.descriptors[int(key) + 1] = Descriptors(features.float().numpy(), feature_type)
+                image_id = int(key) + 1
+                xy = data['keypoints_2d'].detach().cpu()
+                self.db.keypoints[image_id] = xy.float().numpy()
                 extra = {'feature_input': data.get('feature_input')}
-                for name, tensor in (('keypoints_2d', xy), ('features', features)):
+                tensors = {'keypoints_2d': xy}
+                if self.method == 'flexglue':
+                    dense, image_size = data['dense_features'], data['image_size']
+                    if not isinstance(dense, torch.Tensor) or image_size is None:
+                        raise ValueError('FlexGlue requires dense_features and image_size')
+                    self.db.connection.execute('DELETE FROM descriptors WHERE image_id=?', (image_id,))
+                    self._write_extra('dense_features', dense.detach().cpu(), key)
+                    extra.update(image_size=image_size, options=data.get('options'))
+                elif self.method == 'loma':
+                    features = data['features'].detach().cpu()
+                    if len(xy) != len(features):
+                        raise ValueError('Keypoints and descriptors must have the same number of rows')
+                    if features.ndim != 2 or features.shape[1] not in (128, 256):
+                        raise ValueError('LoMa descriptors must be 128- or 256-dimensional')
+                    feature_type = FeatureType.LOMA_B if features.shape[1] == 256 else FeatureType.LOMA_B128
+                    self.db.descriptors[image_id] = Descriptors(features.float().numpy(), feature_type)
+                    tensors['features'] = features
+                else:
+                    raise ValueError(f'Unsupported feature method for COLMAP cache: {self.method}')
+                for name, tensor in tensors.items():
                     extra[name + '_dtype'] = tensor.dtype
                     # COLMAP requires float32; keep double inputs losslessly for Torch callers.
                     if tensor.dtype == torch.float64:
                         extra[name] = tensor
                 self._write_extra(kind, extra, key)
-                self._invalidate_pairs(int(key) + 1)
+                self._invalidate_pairs(image_id)
             elif kind == 'correspondences':
                 ids = tuple(int(index) + 1 for index in key)
                 self.db.matches[ids] = data['indices'].detach().cpu().numpy()
-                self._write_extra(kind, {'scores': data['scores'].detach().cpu()}, key)
+                extra = {name: data[name] for name in ('metadata', 'options') if name in data}
+                self._write_extra(kind, dict(extra, scores=data['scores'].detach().cpu()), key)
                 self.db.connection.execute('DELETE FROM two_view_geometries WHERE pair_id=?',
                                            (image_ids_to_pair_id(*ids),))
                 self.db.connection.execute("DELETE FROM torch_sfm_cache WHERE kind IN ('two_view','two_view_uncalibrated') AND key=?",

@@ -150,8 +150,6 @@ class GlomapConfig:
             self.flexglue = replace(_glomap_flexglue(), **self.flexglue)
         if not isinstance(self.flexglue, FlexGlueConfig):
             raise TypeError('flexglue must be FlexGlueConfig or a dictionary')
-        if self.correspondence_method == 'flexglue' and self.cache_backend != 'filesystem':
-            raise ValueError('FlexGlue dense feature caches require cache_backend="filesystem"')
         if isinstance(self.calibration, dict):
             self.calibration = ViewGraphCalibrationConfig(**self.calibration)
         if not isinstance(self.calibration, ViewGraphCalibrationConfig):
@@ -456,7 +454,7 @@ class GlomapPipeline:
                            if self.cfg.correspondence_method == 'flexglue' else None)
         for frame in tqdm(frames, desc='Extract keypoints'):
             feature_input, mask = self._feature_input(frame)
-            data = (self.cache.load('keypoints', frame.frame_idx) if self.cfg.use_cache
+            data = (self.cache.load_keypoints(frame.frame_idx) if self.cfg.use_cache
                     and not self.cfg.update_cache_for_keypoints else None)
             if data is not None:
                 if data.get('feature_input') != feature_input:
@@ -489,10 +487,10 @@ class GlomapPipeline:
                         'options': feature_options,
                         'feature_input': feature_input,
                     }, frame.frame_idx)
-                    if isinstance(self.cache, FileSystemCache) and frame.dense_features is not None:
+                    if frame.dense_features is not None:
                         # Newly extracted maps should use the same bounded-RAM
                         # path as cache hits, rather than accumulate in memory.
-                        frame.dense_features = self.cache.load('keypoints', frame.frame_idx)['dense_features']
+                        frame.dense_features = self.cache.load_keypoints(frame.frame_idx)['dense_features']
 
         if hasattr(self.extractor, 'release'):
             self.extractor.release()
