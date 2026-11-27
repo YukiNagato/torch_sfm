@@ -33,6 +33,7 @@ loma = [
     "lomatch @ git+https://github.com/davnords/LoMa.git@415caedde23a9ed479172ed174fe4ff7b4514d4b",
 ]
 flexglue = [
+    "scipy>=1.11",
     "raco @ git+https://github.com/cvg/RaCo.git@ee06fa68dbb20303f334fbc257dad71d4149603b",
     "flexglue @ git+https://github.com/cvg/FlexGlue.git@c6cbc7a933bb70ab58608e8835d99b6cc4adca1a",
 ]
@@ -48,6 +49,15 @@ solv3r = [
 ]
 # Optional real-track refinement; model code is loaded from a GlueMap checkout.
 vggsfm = ["einops>=0.7", "kornia==0.8.2", "scipy>=1.11"]
+romav2 = [
+    "romav2 @ git+https://github.com/Parskatt/RoMaV2.git@95c9968145c8906b7b59383258e9f73b02853d89",
+    "raco @ git+https://github.com/cvg/RaCo.git@ee06fa68dbb20303f334fbc257dad71d4149603b",
+    "scipy>=1.11",
+]
+omega = [
+    "vggt-omega @ git+https://github.com/facebookresearch/vggt-omega.git@48b23c8ce72c9a8fcf987f0d7f43d8e4870759f6",
+    "huggingface-hub",
+]
 test = ["pytest>=8", "scipy>=1.11"]
 
 [tool.setuptools]

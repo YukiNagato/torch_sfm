@@ -5,6 +5,8 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class InputCamera:
@@ -20,6 +22,7 @@ class InputImage:
     cam_idx: str
     mask_path: Path | None = None
     depth_path: Path | None = None
+    pose: tuple[tuple[float, ...], ...] | None = None  # OpenCV camera to world
 
 
 @dataclass(frozen=True)
@@ -76,5 +79,13 @@ class DatasetManifest:
             image_path = resolve(entry.get('image_path'), 'image_path', index)
             optional = {field: resolve(entry[field], field, index)
                         for field in ('mask_path', 'depth_path') if entry.get(field) is not None}
+            if entry.get('pose') is not None:
+                pose = np.asarray(entry['pose'])
+                if (pose.shape != (4, 4) or pose.dtype.kind not in 'fiu' or not np.isfinite(pose).all()
+                        or not np.allclose(pose[3], [0, 0, 0, 1], atol=1e-6)
+                        or not np.allclose(pose[:3, :3].T @ pose[:3, :3], np.eye(3), atol=2e-4)
+                        or not np.isclose(np.linalg.det(pose[:3, :3]), 1., atol=2e-4)):
+                    raise ValueError(f'Image {index} pose must be a finite rigid 4x4 camera-to-world matrix')
+                optional['pose'] = tuple(tuple(map(float, row)) for row in pose)
             images.append(InputImage(image_path, cam_idx, **optional))
         return cls(tuple(images), cameras)
